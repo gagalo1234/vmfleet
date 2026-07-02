@@ -1,0 +1,70 @@
+# vmfleet configuration example.
+# Copy to ~/.config/vmfleet/vmfleet.toml (or pass --config) and edit.
+
+[github]
+# Exactly one of `repo` or `org`.
+repo = "owner/name"
+# org = "my-org"
+# PAT with runner admin rights (repo: Administration RW, or org: self-hosted-runners).
+# Env VMFLEET_TOKEN overrides this at runtime.
+token_file = "~/.config/vmfleet/token"
+runner_group_id = 1
+# api_base = "https://api.github.com"   # override for GitHub Enterprise Server
+
+[storage]
+# Filesystem whose free space gates VM launches (where multipass stores instances).
+vault_path = "/var/snap/multipass/common"
+
+[admission]
+min_avail_mib = 4096   # don't launch if MemAvailable below this
+psi_max = 20.0         # don't launch if memory PSI "some avg10" (%) at/above this
+min_disk_gib = 30      # don't launch if vault free space below this
+settle_seconds = 15    # hold the launch lock this long after start (stagger)
+lock_wait_seconds = 60
+poll_seconds = 10      # backpressure re-check interval
+
+[base]
+image = "24.04"
+name = "vmfleet-base"
+disk = "80G"           # size for your heaviest pool (clones inherit this cap)
+cpus = 4
+memory = "8G"
+runner_version = "latest"
+# Provisioning scripts run (in order) inside the base VM by `vmfleet build-base`.
+# Paths are relative to this config file. RUNNER_VERSION is exported to them.
+setup_scripts = ["provision/deps.sh", "provision/runner.sh"]
+
+# One [[pool]] per runner class. Slot ranges must not overlap.
+[[pool]]
+name = "small"
+labels = ["self-hosted-small"]
+cpus = 4
+memory = "4GiB"
+swap = "8G"
+min_warm = 2           # always keep this many idle (warm pool)
+max = 10
+slot_base = 101
+
+[[pool]]
+name = "large"
+labels = ["self-hosted-large"]
+cpus = 20
+memory = "12GiB"
+swap = "8G"
+min_warm = 1
+max = 1
+slot_base = 201
+
+[supervisor]
+poll_seconds = 15
+idle_timeout_seconds = 900    # stop over-provisioned idle workers after this
+max_launch_per_poll = 2       # stagger launches
+busy_reserve_mib = 2048       # per-VM busy working-set estimate for headroom math
+use_jit = true                # JIT registration (no long-lived token inside VMs)
+
+[worker]
+config_timeout_seconds = 180
+registration_timeout_seconds = 180
+offline_grace_seconds = 90
+health_poll_seconds = 10
+cloud_init_timeout_seconds = 180

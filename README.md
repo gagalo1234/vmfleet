@@ -1,0 +1,80 @@
+# vmfleet
+
+Autoscaling fleet of **ephemeral Multipass-VM GitHub Actions runners** for a single
+host. One static Rust binary, one TOML config, guided install and complete uninstall.
+
+Each job runs in a fresh, disposable VM (clean isolation). A supervisor keeps a small
+**warm pool** ready, **bursts** up to a cap when jobs queue, and **scales back down**
+when idle — all bounded by a resource-aware **admission gate** so the host never OOMs.
+
+## Why
+
+Running self-hosted runners as a fixed set of always-on VMs wastes memory when idle
+and blocks jobs when busy. vmfleet scales the fleet to demand and provisions exactly
+when work arrives, while guaranteeing the host stays within a memory/disk budget.
+
+## Requirements
+
+- Linux with **systemd** (user services) and **[Multipass](https://multipass.run)**
+- A GitHub PAT with runner admin (repo: *Administration* RW, or org: *self-hosted runners* RW)
+- `linger` enabled for your user (the installer does this) so services survive logout/reboot
+
+No `gh`, no Python — vmfleet talks to the GitHub REST API directly.
+
+## Quickstart
+
+```bash
+# 1. build (or grab a release binary)
+cargo build --release && install -m755 target/release/vmfleet ~/.local/bin/vmfleet
+
+# 2. guided install — prompts for repo/PAT/pools, installs the supervisor
+vmfleet install
+
+# 3. build the base VM image (one-time; from your provisioning manifest)
+vmfleet build-base
+
+# 4. check
+vmfleet doctor
+vmfleet status
+```
+
+Point your workflows at the pool labels, e.g.:
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, self-hosted-small]
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `vmfleet install` | Guided (or `--non-interactive`) setup: config, linger, supervisor unit |
+| `vmfleet build-base` | Build/rebuild the base VM from the provisioning manifest |
+| `vmfleet status` | Pools, workers, host resources (reads the supervisor's status.json) |
+| `vmfleet doctor` | Preflight: multipass, token+scope, base VM, disk, memory, linger |
+| `vmfleet scale <pool> --min N --max N` | Retune a pool at runtime |
+| `vmfleet gc` | Purge orphan VMs / stale runner records (namespaced, safe) |
+| `vmfleet uninstall [--purge-all]` | Stop the fleet; remove VMs/runners/units (+config/base) |
+| `vmfleet supervisor` / `worker` | Internal: run by systemd; not called by hand |
+
+## How it scales
+
+Per pool each cycle: `desired = clamp(min_warm, busy + queued + min_warm, max)`.
+Workers are transient systemd units with **no `Restart=`**, so a finished ephemeral
+worker simply stays down until a later cycle relaunches it — that's the scale-down.
+Before any VM launch, the **admission gate** (a shared flock) serializes launches and
+waits until `MemAvailable`, memory-PSI and vault disk are within budget.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Configuration
+
+A single [`vmfleet.toml`](examples/vmfleet.toml) (default `~/.config/vmfleet/vmfleet.toml`)
+replaces scattered env vars. Everything — repo/org, pools, labels, admission
+thresholds, base-image provisioning — lives there. See [docs/CONFIG.md](docs/CONFIG.md).
+
+## License
+
+MIT.

@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+# never commit real secrets/state
+/token
+*.pat
