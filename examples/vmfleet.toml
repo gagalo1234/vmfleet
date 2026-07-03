@@ -23,9 +23,12 @@ settle_seconds = 15    # hold the launch lock this long after start (stagger)
 lock_wait_seconds = 60
 poll_seconds = 10      # backpressure re-check interval
 
-[base]
-image = "24.04"
+# One or more base images ([[base]] tables). Pools clone from their referenced
+# base, or the first one. Give a small pool its own smaller-disk base if you
+# don't want it to inherit a large pool's disk cap.
+[[base]]
 name = "vmfleet-base"
+image = "24.04"
 disk = "80G"           # size for your heaviest pool (clones inherit this cap)
 cpus = 4
 memory = "8G"
@@ -33,6 +36,13 @@ runner_version = "latest"
 # Provisioning scripts run (in order) inside the base VM by `vmfleet build-base`.
 # Paths are relative to this config file. RUNNER_VERSION is exported to them.
 setup_scripts = ["provision/deps.sh", "provision/runner.sh"]
+
+# Optional second base with a smaller disk for light pools:
+# [[base]]
+# name = "vmfleet-base-small"
+# image = "24.04"
+# disk = "30G"
+# setup_scripts = ["provision/deps.sh", "provision/runner.sh"]
 
 # One [[pool]] per runner class. Slot ranges must not overlap.
 [[pool]]
@@ -44,6 +54,7 @@ swap = "8G"
 min_warm = 2           # always keep this many idle (warm pool)
 max = 10
 slot_base = 101
+# base = "vmfleet-base-small"   # optional: clone this pool from a specific base
 
 [[pool]]
 name = "large"
@@ -61,6 +72,7 @@ idle_timeout_seconds = 900    # stop over-provisioned idle workers after this
 max_launch_per_poll = 2       # stagger launches
 busy_reserve_mib = 2048       # per-VM busy working-set estimate for headroom math
 use_jit = true                # JIT registration (no long-lived token inside VMs)
+queued_poll_every = 4         # scan queued jobs only every Nth cycle (API cost)
 
 [worker]
 config_timeout_seconds = 180

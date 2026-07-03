@@ -40,8 +40,47 @@ impl<'a> Systemd<'a> {
         args.push(program.to_string());
         args.extend(prog_args.iter().cloned());
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        // A prior worker that exited non-zero leaves the transient unit in a
+        // `failed` state, and systemd-run refuses to reuse the name. Clear it
+        // first (idempotent, ignore errors) so the slot never wedges.
+        self.reset_failed(unit);
         checked(self.r, "systemd-run", &refs, Some(Duration::from_secs(30)))?;
         Ok(())
+    }
+
+    /// Clear a unit's failed state (no-op if not failed).
+    pub fn reset_failed(&self, unit: &str) {
+        let _ = self.r.run(
+            "systemctl",
+            &["--user", "reset-failed", unit],
+            Some(Duration::from_secs(10)),
+        );
+    }
+
+    /// Names of failed units matching a glob (for the supervisor's periodic sweep).
+    pub fn list_failed(&self, pattern: &str) -> Vec<String> {
+        self.r
+            .run(
+                "systemctl",
+                &[
+                    "--user",
+                    "list-units",
+                    pattern,
+                    "--no-legend",
+                    "--plain",
+                    "--state=failed",
+                ],
+                Some(Duration::from_secs(15)),
+            )
+            .map(|o| {
+                o.stdout
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next())
+                    .filter(|u| u.ends_with(".service"))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Active/activating transient worker unit names matching a glob (e.g. "vmfleet-worker-*").
@@ -97,6 +136,16 @@ impl<'a> Systemd<'a> {
             self.r,
             "systemctl",
             &["--user", "enable", "--now", unit],
+            Some(Duration::from_secs(30)),
+        )?;
+        Ok(())
+    }
+
+    pub fn restart(&self, unit: &str) -> Result<()> {
+        checked(
+            self.r,
+            "systemctl",
+            &["--user", "restart", unit],
             Some(Duration::from_secs(30)),
         )?;
         Ok(())
