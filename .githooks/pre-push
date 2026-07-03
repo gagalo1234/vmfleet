@@ -4,7 +4,9 @@
 #
 # Git feeds ref updates on stdin, one per line:
 #   <local ref> <local sha> <remote ref> <remote sha>
-# We reject any update that targets refs/heads/main on the remote.
+# We reject any update whose remote ref is refs/heads/main. Matching on the
+# remote ref alone covers pushes AND deletions of main, while leaving every
+# other branch (and its deletion) untouched.
 #
 # Bypass (use sparingly, and only when you really mean it):
 #   git push --no-verify
@@ -12,14 +14,10 @@
 set -euo pipefail
 
 protected_branch="main"
-zero="0000000000000000000000000000000000000000"
 
 while read -r local_ref local_sha remote_ref remote_sha; do
-	# Skip branch deletions (local_sha is all zeros).
-	[ "$local_sha" = "$zero" ] && continue
-
 	if [ "$remote_ref" = "refs/heads/${protected_branch}" ]; then
-		echo "pre-push: direct push to '${protected_branch}' is blocked." >&2
+		echo "pre-push: pushing to or deleting '${protected_branch}' is blocked." >&2
 		echo "          Open a pull request instead, or bypass with 'git push --no-verify'." >&2
 		exit 1
 	fi
