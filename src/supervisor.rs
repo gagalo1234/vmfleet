@@ -112,10 +112,12 @@ pub struct SupState {
     idle_since: HashMap<String, Instant>,
     cycle: u64,
     cached_queued: HashMap<String, u32>,
-    /// Last time the passive release check ran (throttled to the configured interval).
+    /// Last time the passive release check was *started* (throttled to the interval).
     last_update_check: Option<Instant>,
     /// Latest available version if newer than the running one, else None.
     latest_version: Option<String>,
+    /// Receiver for an in-flight background update check (None => none running).
+    update_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
 }
 
 /// One reconcile pass. Public-in-crate so `status` can render a live view too.
@@ -274,33 +276,11 @@ pub fn reconcile(
         });
     }
 
-    // Passive update check: surface (never auto-install) a newer release. Throttled
-    // and best-effort — a short-timeout HTTP call that swallows all errors so it can
-    // never fail or meaningfully stall the reconcile loop.
+    // Passive update check: surface (never auto-install) a newer release. Runs in a
+    // background thread and hands the result back via a channel, so the network call
+    // (up to ~40s with timeouts/retries) can never block or stall this reconcile loop.
     if cfg.supervisor.update_check {
-        let interval =
-            Duration::from_secs(cfg.supervisor.update_check_interval_hours.max(1) * 3600);
-        let due = state
-            .last_update_check
-            .map(|t| t.elapsed() >= interval)
-            .unwrap_or(true);
-        if due {
-            state.last_update_check = Some(Instant::now());
-            if let Some(latest) = crate::selfupdate::latest_version(cfg.token().ok().as_deref()) {
-                if crate::selfupdate::update_available(&latest) {
-                    if state.latest_version.as_deref() != Some(latest.as_str()) {
-                        tracing::warn!(
-                            "vmfleet update available: {} -> {} (run: vmfleet self-update)",
-                            crate::selfupdate::current_version(),
-                            latest
-                        );
-                    }
-                    state.latest_version = Some(latest);
-                } else {
-                    state.latest_version = None;
-                }
-            }
-        }
+        maybe_update_check(cfg, state);
     }
 
     let report = Report {
@@ -388,6 +368,60 @@ fn slot_from_unit(unit: &str) -> Option<u32> {
         .strip_suffix(".service")?
         .parse()
         .ok()
+}
+
+/// Non-blocking passive update check. If a background check has finished, apply its
+/// result; otherwise, when the interval has elapsed, spawn a new background thread to
+/// fetch the latest release. Best-effort — errors are swallowed and the network call
+/// runs off-loop so it can never block reconciliation.
+fn maybe_update_check(cfg: &Config, state: &mut SupState) {
+    use std::sync::mpsc::TryRecvError;
+
+    // 1. Apply a completed background check, if any.
+    if let Some(rx) = &state.update_rx {
+        match rx.try_recv() {
+            Ok(result) => {
+                if let Some(latest) = result {
+                    if crate::selfupdate::update_available(&latest) {
+                        if state.latest_version.as_deref() != Some(latest.as_str()) {
+                            tracing::warn!(
+                                "vmfleet update available: {} -> {} (run: vmfleet self-update)",
+                                crate::selfupdate::current_version(),
+                                latest
+                            );
+                        }
+                        state.latest_version = Some(latest);
+                    } else {
+                        state.latest_version = None;
+                    }
+                }
+                state.update_rx = None;
+            }
+            // Thread died without sending: drop the receiver, retry when next due.
+            Err(TryRecvError::Disconnected) => state.update_rx = None,
+            // Still running: leave it for a later cycle.
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    // 2. Start a new check if none is in flight and the interval has elapsed.
+    if state.update_rx.is_none() {
+        let interval =
+            Duration::from_secs(cfg.supervisor.update_check_interval_hours.max(1) * 3600);
+        let due = state
+            .last_update_check
+            .map(|t| t.elapsed() >= interval)
+            .unwrap_or(true);
+        if due {
+            state.last_update_check = Some(Instant::now());
+            let (tx, rx) = std::sync::mpsc::channel();
+            state.update_rx = Some(rx);
+            let token = cfg.token().ok();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::selfupdate::latest_version(token.as_deref()));
+            });
+        }
+    }
 }
 
 fn write_status(report: &Report) {

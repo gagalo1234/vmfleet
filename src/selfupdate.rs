@@ -210,11 +210,10 @@ fn fetch_release(
 /// Pure: newest non-draft release by semver, prereleases allowed. Used for the
 /// `--allow-prerelease` path and unit-tested via [`pick_newest_meta`].
 fn pick_newest(releases: Vec<Release>) -> Option<Release> {
-    releases.into_iter().filter(|r| !r.draft).max_by(|a, b| {
-        let va = parse_version(&a.tag_name).unwrap_or((0, 0, 0));
-        let vb = parse_version(&b.tag_name).unwrap_or((0, 0, 0));
-        va.cmp(&vb)
-    })
+    releases
+        .into_iter()
+        .filter(|r| !r.draft)
+        .max_by(|a, b| cmp_versions(&a.tag_name, &b.tag_name))
 }
 
 // ===================== download / verify / install =====================
@@ -402,24 +401,67 @@ fn asset_name(version: &str, target: &str) -> String {
     format!("vmfleet-{version}-{target}.tar.gz")
 }
 
-/// Parse a `MAJOR.MINOR.PATCH` version, tolerating a leading `v` and dropping any
-/// `-prerelease`/`+build` suffix (CI enforces plain `X.Y.Z` for the base).
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+/// Parse into `(MAJOR.MINOR.PATCH, prerelease identifiers)`, tolerating a leading
+/// `v` and ignoring any `+build` metadata. An empty identifier list means a stable
+/// release. E.g. `v0.2.0-rc.1` -> `((0,2,0), ["rc","1"])`.
+fn parse_version_full(s: &str) -> Option<((u64, u64, u64), Vec<String>)> {
     let s = s.trim().trim_start_matches('v');
-    let base = s.split(['-', '+']).next()?;
+    let s = s.split('+').next().unwrap_or(s); // drop build metadata
+    let mut parts = s.splitn(2, '-');
+    let base = parts.next()?;
     let mut it = base.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     let patch = it.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+    let pre = match parts.next() {
+        Some(p) if !p.is_empty() => p.split('.').map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    Some(((major, minor, patch), pre))
 }
 
-/// True when `candidate` parses to a strictly greater version than `current`.
-fn is_newer(candidate: &str, current: &str) -> bool {
-    match (parse_version(candidate), parse_version(current)) {
-        (Some(c), Some(cur)) => c > cur,
-        _ => false,
+/// SemVer precedence: compare the base triple, then the prerelease (per §11.3-11.4,
+/// a stable release outranks any prerelease of the same base). Unparseable inputs
+/// sort below parseable ones.
+fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (parse_version_full(a), parse_version_full(b)) {
+        (Some((av, ap)), Some((bv, bp))) => av.cmp(&bv).then_with(|| cmp_prerelease(&ap, &bp)),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
     }
+}
+
+/// Prerelease-identifier precedence (SemVer §11.4). Empty list = stable = highest.
+/// Numeric identifiers compare numerically and rank below alphanumeric ones; when
+/// all shared identifiers are equal, the longer list wins.
+fn cmp_prerelease(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater, // stable > prerelease
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            for (x, y) in a.iter().zip(b.iter()) {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(xn), Ok(yn)) => xn.cmp(&yn),
+                    (Ok(_), Err(_)) => Ordering::Less, // numeric < alphanumeric
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.as_str().cmp(y.as_str()),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+    }
+}
+
+/// True when `candidate` has strictly greater SemVer precedence than `current`.
+fn is_newer(candidate: &str, current: &str) -> bool {
+    cmp_versions(candidate, current) == std::cmp::Ordering::Greater
 }
 
 /// Extract the hex digest from `sha256sum` output (`<hex>  <filename>`), or a
@@ -531,11 +573,18 @@ mod tests {
 
     #[test]
     fn parses_versions() {
-        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("v0.2.0-rc.1"), Some((0, 2, 0)));
-        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_version("nope"), None);
+        assert_eq!(parse_version_full("v1.2.3"), Some(((1, 2, 3), vec![])));
+        assert_eq!(parse_version_full("1.2.3"), Some(((1, 2, 3), vec![])));
+        assert_eq!(
+            parse_version_full("v0.2.0-rc.1"),
+            Some(((0, 2, 0), vec!["rc".to_string(), "1".to_string()]))
+        );
+        assert_eq!(parse_version_full("1.2"), Some(((1, 2, 0), vec![])));
+        assert_eq!(
+            parse_version_full("1.2.3+build.5"),
+            Some(((1, 2, 3), vec![]))
+        );
+        assert_eq!(parse_version_full("nope"), None);
     }
 
     #[test]
@@ -546,6 +595,25 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0")); // equal is not newer
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn compares_prerelease_versions() {
+        // Numeric prerelease identifiers compare numerically, not lexically
+        // (11 > 2; lexical string compare would get this wrong).
+        assert!(is_newer("0.2.0-rc.2", "0.2.0-rc.1"));
+        assert!(is_newer("0.2.0-rc.11", "0.2.0-rc.2"));
+        // Stable outranks any prerelease of the same base (SemVer §11.3).
+        assert!(is_newer("0.2.0", "0.2.0-rc.2"));
+        assert!(!is_newer("0.2.0-rc.1", "0.2.0"));
+        // Higher base beats a prerelease of a lower base.
+        assert!(is_newer("0.3.0-rc.1", "0.2.0"));
+        // A larger set of prerelease fields has higher precedence (§11.4).
+        assert!(is_newer("0.2.0-rc.1.1", "0.2.0-rc.1"));
+        // Equal prereleases are not newer.
+        assert!(!is_newer("0.2.0-rc.1", "0.2.0-rc.1"));
+        // Numeric identifiers rank below alphanumeric ones.
+        assert!(is_newer("0.2.0-rc", "0.2.0-1"));
     }
 
     #[test]
@@ -584,11 +652,7 @@ mod tests {
         items
             .iter()
             .filter(|(_, draft)| !draft)
-            .max_by(|(a, _), (b, _)| {
-                parse_version(a)
-                    .unwrap_or((0, 0, 0))
-                    .cmp(&parse_version(b).unwrap_or((0, 0, 0)))
-            })
+            .max_by(|(a, _), (b, _)| cmp_versions(a, b))
             .map(|(t, _)| t.to_string())
     }
 
