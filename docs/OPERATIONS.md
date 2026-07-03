@@ -37,13 +37,13 @@ leaving a Stopped/Running orphan VM). vmfleet bounds teardown timeouts to avoid 
 long hang, and:
 
 ```bash
-vmfleet gc     # purge orphan vmfleet VMs + delete stale offline runner records
+vmfleet prune  # purge orphan vmfleet VMs + delete stale offline runner records (alias: gc)
 ```
 
 Consider a periodic timer:
 
 ```ini
-# ~/.config/systemd/user/vmfleet-gc.timer  (+ matching .service running `vmfleet gc`)
+# ~/.config/systemd/user/vmfleet-gc.timer  (+ matching .service running `vmfleet prune`)
 [Timer]
 OnCalendar=hourly
 ```

@@ -21,6 +21,11 @@ All notable changes to vmfleet are documented here. The format follows
   always selects the matching release asset.
 - `CHANGELOG.md` and `RELEASING.md`.
 
+### Changed
+- Command naming pass for consistency (old names kept as aliases): `gc` → `prune`,
+  `config-check` → `check`. The internal `supervisor` / `worker` subcommands are now
+  hidden from `--help`.
+
 ## [0.1.0]
 
 Initial release: single-host autoscaling fleet of ephemeral Multipass-VM GitHub

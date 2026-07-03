@@ -55,7 +55,7 @@ jobs:
 | `vmfleet status` | Pools, workers, host resources (reads the supervisor's status.json) |
 | `vmfleet doctor` | Preflight: multipass, token+scope, base VM, disk, memory, linger |
 | `vmfleet scale <pool> --min N --max N` | Retune a pool at runtime |
-| `vmfleet gc` | Purge orphan VMs / stale runner records (namespaced, safe) |
+| `vmfleet prune` | Purge orphan VMs / stale runner records (namespaced, safe; alias `gc`) |
 | `vmfleet self-update [--check]` | Update the binary in place from the latest GitHub Release (checksum-verified), then migrate config/units + restart supervisor |
 | `vmfleet uninstall [--purge-all]` | Stop the fleet; remove VMs/runners/units (+config/base) |
 | `vmfleet supervisor` / `worker` | Internal: run by systemd; not called by hand |

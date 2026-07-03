@@ -40,8 +40,10 @@ enum Cmd {
     /// Complete teardown of this fleet (VMs, runners, units; optionally config/base).
     Uninstall(UninstallArgs),
     /// Run the autoscaling control-plane loop (systemd ExecStart).
+    #[command(hide = true)]
     Supervisor,
     /// Run a single ephemeral VM worker for a pool+slot (spawned by the supervisor).
+    #[command(hide = true)]
     Worker { pool: String, slot: u32 },
     /// Show fleet status (pools, workers, host resources).
     Status,
@@ -52,8 +54,9 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Garbage-collect orphan VMs and stale runner records.
-    Gc,
+    /// Purge orphan VMs and stale runner records.
+    #[command(alias = "gc")]
+    Prune,
     /// Adjust a pool's min/max at runtime (writes config).
     Scale {
         pool: String,
@@ -63,7 +66,8 @@ enum Cmd {
         max: Option<u32>,
     },
     /// Validate the config file.
-    ConfigCheck,
+    #[command(alias = "config-check")]
+    Check,
     /// Update vmfleet in place from the latest GitHub Release.
     #[command(alias = "update")]
     SelfUpdate(SelfUpdateArgs),
@@ -133,7 +137,7 @@ fn run() -> Result<()> {
     let cfg_path = config_path(&cli);
 
     match &cli.cmd {
-        Cmd::ConfigCheck => {
+        Cmd::Check => {
             let cfg = config::Config::load(&cfg_path)?;
             println!(
                 "OK: {} — {} pool(s), scope {}",
@@ -145,7 +149,7 @@ fn run() -> Result<()> {
         }
         Cmd::Doctor => commands::doctor(&cfg_path),
         Cmd::Status => commands::status(&cfg_path),
-        Cmd::Gc => commands::gc(&cfg_path),
+        Cmd::Prune => commands::gc(&cfg_path),
         Cmd::Scale { pool, min, max } => commands::scale(&cfg_path, pool, *min, *max),
         Cmd::BuildBase { force } => commands::build_base(&cfg_path, *force),
         Cmd::Install(a) => commands::install(

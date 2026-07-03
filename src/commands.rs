@@ -383,7 +383,7 @@ fn install_gc_timer(exe: &Path, cfg_path: &Path) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     // Quote paths so spaces don't split into extra ExecStart arguments.
     let svc = format!(
-        "[Unit]\nDescription=vmfleet orphan GC\n\n[Service]\nType=oneshot\nExecStart=\"{}\" --config \"{}\" gc\n",
+        "[Unit]\nDescription=vmfleet orphan GC\n\n[Service]\nType=oneshot\nExecStart=\"{}\" --config \"{}\" prune\n",
         exe.display(),
         abs(cfg_path).display()
     );
