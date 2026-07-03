@@ -58,11 +58,34 @@ window.
 
 ## Upgrades
 
+**Preferred — in-place self-update from a published release:**
+
+```bash
+vmfleet self-update --check    # report whether a newer release exists
+vmfleet self-update            # download + verify sha256 + swap binary + migrate + restart
+```
+
+`self-update` fetches the GitHub Release tarball for this host's target triple,
+verifies its `.sha256`, atomically replaces the running binary, then re-runs
+`install --upgrade` (config migration + unit rewrite) and restarts the supervisor.
+Useful flags: `--tag vX.Y.Z` (pin a version), `--yes` (no prompt), `--no-restart`
+(swap only), `--allow-prerelease`.
+
+The supervisor also runs a periodic, best-effort **update check** (config:
+`[supervisor] update_check`, default on; `update_check_interval_hours`, default 24)
+and *notifies only* — it never auto-installs. When behind, it emits a log line, adds
+`update_available` / `latest_version` to `status.json`, sets the Prometheus gauge
+`vmfleet_update_available`, and `vmfleet status` prints a one-line hint.
+
+**Fallback — build from source** (e.g. an unreleased commit, or air-gapped hosts):
+
 ```bash
 git pull && cargo build --release && install -m755 target/release/vmfleet ~/.local/bin/vmfleet
 vmfleet install --upgrade      # reinstall unit / migrate config
 systemctl --user restart vmfleet-supervisor
 ```
+
+Cutting a release (maintainers): see [../RELEASING.md](../RELEASING.md).
 
 ## Uninstall
 

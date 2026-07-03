@@ -58,6 +58,8 @@ PAT scopes: repo → *Administration: Read and write*; org → *Self-hosted runn
 | `max_launch_per_poll` | `2` | stagger: max launches per cycle |
 | `busy_reserve_mib` | `2048` | per-VM busy working-set estimate for headroom math |
 | `use_jit` | `true` | JIT registration (no long-lived token inside VMs) |
+| `update_check` | `true` | periodically check GitHub Releases and surface (never auto-install) when a newer vmfleet is available |
+| `update_check_interval_hours` | `24` | how often to run the passive update check |
 
 ## `[worker]`
 | key | default | meaning |

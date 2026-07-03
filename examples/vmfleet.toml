@@ -73,6 +73,8 @@ max_launch_per_poll = 2       # stagger launches
 busy_reserve_mib = 2048       # per-VM busy working-set estimate for headroom math
 use_jit = true                # JIT registration (no long-lived token inside VMs)
 queued_poll_every = 4         # scan queued jobs only every Nth cycle (API cost)
+update_check = true                 # notify (never auto-install) when a newer release exists
+update_check_interval_hours = 24    # how often to run the passive update check
 
 [worker]
 config_timeout_seconds = 180

@@ -119,6 +119,7 @@ pub fn status(cfg_path: &Path) -> Result<()> {
         Ok(s) => {
             println!("# supervisor status ({})", paths::status_file().display());
             println!("{s}");
+            print_update_hint(&s);
         }
         Err(_) => println!("(no status yet — is the supervisor running?)"),
     }
@@ -146,6 +147,26 @@ pub fn status(cfg_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Print a one-line "update available" hint if the supervisor's status.json says so.
+fn print_update_hint(status_json: &str) {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        update_available: bool,
+        #[serde(default)]
+        latest_version: Option<String>,
+    }
+    if let Ok(peek) = serde_json::from_str::<Peek>(status_json) {
+        if let (true, Some(latest)) = (peek.update_available, peek.latest_version) {
+            println!(
+                "\n>> update available: {} -> {} (run: vmfleet self-update)",
+                crate::selfupdate::current_version(),
+                latest
+            );
+        }
+    }
 }
 
 // ===================== gc =====================

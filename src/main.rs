@@ -10,6 +10,7 @@ mod multipass;
 mod naming;
 mod paths;
 mod resources;
+mod selfupdate;
 mod supervisor;
 mod systemd;
 mod worker;
@@ -63,6 +64,28 @@ enum Cmd {
     },
     /// Validate the config file.
     ConfigCheck,
+    /// Update vmfleet in place from the latest GitHub Release.
+    #[command(alias = "update")]
+    SelfUpdate(SelfUpdateArgs),
+}
+
+#[derive(clap::Args)]
+struct SelfUpdateArgs {
+    /// Report whether an update is available; do not download or install.
+    #[arg(long)]
+    check: bool,
+    /// Install a specific release tag (e.g. v0.2.0) instead of the latest.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Consider prerelease releases when choosing the latest.
+    #[arg(long)]
+    allow_prerelease: bool,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    yes: bool,
+    /// Swap the binary but do not migrate config / rewrite units / restart supervisor.
+    #[arg(long)]
+    no_restart: bool,
 }
 
 #[derive(clap::Args)]
@@ -148,5 +171,15 @@ fn run() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             worker::run(&cfg, pool, *slot)
         }
+        Cmd::SelfUpdate(a) => selfupdate::run(
+            &cfg_path,
+            &selfupdate::Opts {
+                check: a.check,
+                tag: a.tag.clone(),
+                allow_prerelease: a.allow_prerelease,
+                yes: a.yes,
+                no_restart: a.no_restart,
+            },
+        ),
     }
 }

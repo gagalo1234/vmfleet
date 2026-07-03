@@ -46,12 +46,18 @@ struct PoolReport {
 #[derive(Serialize)]
 struct Report {
     ts: u64,
+    /// Running vmfleet version (from CARGO_PKG_VERSION).
+    version: String,
     mem_avail_mib: u64,
     psi: f64,
     disk_free_gib: u64,
     blocked: Option<String>,
     headroom_vms: u32,
     pools: Vec<PoolReport>,
+    /// A newer published release is available (passive check; notify only).
+    update_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
 }
 
 pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
@@ -106,6 +112,10 @@ pub struct SupState {
     idle_since: HashMap<String, Instant>,
     cycle: u64,
     cached_queued: HashMap<String, u32>,
+    /// Last time the passive release check ran (throttled to the configured interval).
+    last_update_check: Option<Instant>,
+    /// Latest available version if newer than the running one, else None.
+    latest_version: Option<String>,
 }
 
 /// One reconcile pass. Public-in-crate so `status` can render a live view too.
@@ -264,11 +274,41 @@ pub fn reconcile(
         });
     }
 
+    // Passive update check: surface (never auto-install) a newer release. Throttled
+    // and best-effort — a short-timeout HTTP call that swallows all errors so it can
+    // never fail or meaningfully stall the reconcile loop.
+    if cfg.supervisor.update_check {
+        let interval =
+            Duration::from_secs(cfg.supervisor.update_check_interval_hours.max(1) * 3600);
+        let due = state
+            .last_update_check
+            .map(|t| t.elapsed() >= interval)
+            .unwrap_or(true);
+        if due {
+            state.last_update_check = Some(Instant::now());
+            if let Some(latest) = crate::selfupdate::latest_version(cfg.token().ok().as_deref()) {
+                if crate::selfupdate::update_available(&latest) {
+                    if state.latest_version.as_deref() != Some(latest.as_str()) {
+                        tracing::warn!(
+                            "vmfleet update available: {} -> {} (run: vmfleet self-update)",
+                            crate::selfupdate::current_version(),
+                            latest
+                        );
+                    }
+                    state.latest_version = Some(latest);
+                } else {
+                    state.latest_version = None;
+                }
+            }
+        }
+    }
+
     let report = Report {
         ts: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        version: crate::selfupdate::current_version().to_string(),
         mem_avail_mib: avail,
         psi,
         disk_free_gib: disk,
@@ -279,6 +319,8 @@ pub fn reconcile(
             cfg.supervisor.busy_reserve_mib,
         ),
         pools: reports,
+        update_available: state.latest_version.is_some(),
+        latest_version: state.latest_version.clone(),
     };
     write_status(&report);
     write_metrics(&report);
@@ -298,6 +340,12 @@ fn write_metrics(report: &Report) {
     s.push_str(&format!(
         "vmfleet_blocked {}\n",
         report.blocked.is_some() as u8
+    ));
+    let cur = crate::selfupdate::current_version();
+    let latest = report.latest_version.as_deref().unwrap_or(cur);
+    s.push_str(&format!(
+        "vmfleet_update_available{{current=\"{cur}\",latest=\"{latest}\"}} {}\n",
+        report.update_available as u8
     ));
     for p in &report.pools {
         let l = &p.name;

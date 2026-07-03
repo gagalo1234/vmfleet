@@ -56,8 +56,23 @@ jobs:
 | `vmfleet doctor` | Preflight: multipass, token+scope, base VM, disk, memory, linger |
 | `vmfleet scale <pool> --min N --max N` | Retune a pool at runtime |
 | `vmfleet gc` | Purge orphan VMs / stale runner records (namespaced, safe) |
+| `vmfleet self-update [--check]` | Update the binary in place from the latest GitHub Release (checksum-verified), then migrate config/units + restart supervisor |
 | `vmfleet uninstall [--purge-all]` | Stop the fleet; remove VMs/runners/units (+config/base) |
 | `vmfleet supervisor` / `worker` | Internal: run by systemd; not called by hand |
+
+## Updating
+
+```bash
+vmfleet self-update --check     # is a newer release available?
+vmfleet self-update             # download (verified), swap binary, migrate + restart
+```
+
+`self-update` downloads the release tarball for your exact target, verifies its
+SHA-256, atomically replaces the running binary, then runs `install --upgrade` and
+restarts the supervisor. The running supervisor also checks periodically and surfaces
+"update available" in `vmfleet status`, `status.json`, and a Prometheus gauge — it
+never auto-installs. See [docs/OPERATIONS.md](docs/OPERATIONS.md#upgrades) and, for
+maintainers cutting a release, [RELEASING.md](RELEASING.md).
 
 ## How it scales
 
