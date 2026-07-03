@@ -1,0 +1,52 @@
+name: promote
+
+# Explicit production promote (team-git-workflow.md §6): release.yml only stages a
+# DRAFT. Publishing is a deliberate, human-gated action. This workflow is dispatched
+# manually and runs in the `production` environment, whose required reviewers must
+# approve before the job proceeds — the "显式 promote" gate. The final step just flips
+# the existing draft to published; it builds nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: production   # required-reviewer gate configured in repo settings
+    permissions:
+      contents: write         # flip the draft release to published
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: release exists and is still a draft
+        run: |
+          is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::release $TAG is missing or already published (isDraft=$is_draft)"
+            exit 1
+          fi
+      - name: verify artifacts and checksums (release health check)
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+          cd assets
+          count="$(find . -maxdepth 1 -name 'vmfleet-*.tar.gz' | wc -l)"
+          if [ "$count" -lt 4 ]; then
+            echo "::error::expected >=4 target tarballs, found $count"
+            exit 1
+          fi
+          for sum in *.sha256; do
+            sha256sum -c "$sum"
+          done
+          echo "verified $count artifacts with matching checksums"
+      - name: publish
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "published $TAG"
