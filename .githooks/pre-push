@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# pre-push hook: protect the main branch from direct pushes.
+#
+# Git feeds ref updates on stdin, one per line:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# We reject any update that targets refs/heads/main on the remote.
+#
+# Bypass (use sparingly, and only when you really mean it):
+#   git push --no-verify
+
+set -euo pipefail
+
+protected_branch="main"
+zero="0000000000000000000000000000000000000000"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+	# Skip branch deletions (local_sha is all zeros).
+	[ "$local_sha" = "$zero" ] && continue
+
+	if [ "$remote_ref" = "refs/heads/${protected_branch}" ]; then
+		echo "pre-push: direct push to '${protected_branch}' is blocked." >&2
+		echo "          Open a pull request instead, or bypass with 'git push --no-verify'." >&2
+		exit 1
+	fi
+done
+
+exit 0
