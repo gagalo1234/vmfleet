@@ -29,8 +29,8 @@ No `gh`, no Python — vmfleet talks to the GitHub REST API directly.
 # 1. build (or grab a release binary)
 cargo build --release && install -m755 target/release/vmfleet ~/.local/bin/vmfleet
 
-# 2. guided install — prompts for repo/pools, authenticates via browser device
-#    flow (or paste a PAT), installs the supervisor
+# 2. guided install — pick an auth method (browser device flow / paste a PAT),
+#    then repo/pools; installs the supervisor
 vmfleet install
 
 # 3. build the base VM image (one-time; from your provisioning manifest)

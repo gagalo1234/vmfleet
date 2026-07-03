@@ -412,8 +412,31 @@ fn supervisor_unit_contents(exe: &Path, cfg_path: &Path) -> String {
 }
 
 fn prompt_config(cfg_path: &Path) -> Result<Config> {
-    use dialoguer::{Confirm, Input};
+    use dialoguer::{Confirm, Input, Select};
     println!("== vmfleet guided install ==");
+
+    // The token always lives at the standard path; advanced users can point the
+    // config elsewhere by editing the TOML afterwards.
+    let token_file = paths::config_dir().join("token");
+    let have_token = token_file.exists();
+
+    // 1. Authentication method, asked up front (like `gh auth login`). The actual
+    //    device-flow / paste happens after we know the scope, below.
+    let mut methods = vec![
+        "Log in with a browser (GitHub device flow)",
+        "Paste a Personal Access Token",
+    ];
+    if have_token {
+        methods.push("Reuse the existing token file");
+    }
+    let method = Select::new()
+        .with_prompt("Authenticate to GitHub")
+        .items(&methods)
+        .default(0)
+        .interact()?;
+
+    // 2. Which repo/org this fleet serves — also determines the least-privilege
+    //    device-flow scope (repo -> `repo`, org -> `admin:org`).
     let scope: String = Input::new()
         .with_prompt("GitHub repo (owner/name) or org (@org)")
         .interact_text()?;
@@ -422,20 +445,18 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
     } else {
         (Some(scope), None)
     };
-    let token_file: String = Input::new()
-        .with_prompt("Path to token file")
-        .default(
-            paths::config_dir()
-                .join("token")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .interact_text()?;
-    if !Path::new(&token_file).exists() {
-        let scope = crate::oauth::scope_from_repo(repo.is_some());
-        let tok = obtain_token(scope)?;
-        store_token(Path::new(&token_file), &tok)?;
+
+    // 3. Obtain + store the token per the chosen method (index 2 = reuse existing).
+    match method {
+        0 => {
+            let scope = crate::oauth::scope_from_repo(repo.is_some());
+            let tok = crate::oauth::login(scope, crate::oauth::DEFAULT_POLL_INTERVAL)?;
+            store_token(&token_file, &tok)?;
+        }
+        1 => store_token(&token_file, &prompt_pat()?)?,
+        _ => println!("reusing existing token at {}", token_file.display()),
     }
+
     let vault: String = Input::new()
         .with_prompt("Multipass vault path (disk gate)")
         .default("/var/snap/multipass/common".into())
@@ -468,7 +489,7 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         github: GitHub {
             repo,
             org,
-            token_file: token_file.into(),
+            token_file,
             runner_group_id: 1,
             api_base: "https://api.github.com".into(),
         },
@@ -515,23 +536,13 @@ fn set_mode_600(path: &str) {
     }
 }
 
-/// Obtain a GitHub token interactively: browser device flow by default (like
-/// `gh auth login`), with manual PAT paste as a fallback for no-browser / CI /
-/// GHES setups. `scope` is the OAuth scope the device flow requests.
-fn obtain_token(scope: &str) -> Result<String> {
-    use dialoguer::{Confirm, Input};
-    let use_browser = Confirm::new()
-        .with_prompt("Authenticate via browser (GitHub device flow)?")
-        .default(true)
-        .interact()?;
-    if use_browser {
-        crate::oauth::login(scope, crate::oauth::DEFAULT_POLL_INTERVAL)
-    } else {
-        let tok: String = Input::new()
-            .with_prompt("Paste PAT (stored 0600)")
-            .interact_text()?;
-        Ok(tok.trim().to_string())
-    }
+/// Prompt for a Personal Access Token and return it trimmed.
+fn prompt_pat() -> Result<String> {
+    use dialoguer::Input;
+    let tok: String = Input::new()
+        .with_prompt("Paste PAT (stored 0600)")
+        .interact_text()?;
+    Ok(tok.trim().to_string())
 }
 
 /// Persist a token to `path` (creating its parent dir) with 0600 permissions.
@@ -561,11 +572,7 @@ pub fn login(cfg_path: &Path, opts: &LoginOpts) -> Result<()> {
     }
     let cfg = Config::load(cfg_path)?;
     let token = if opts.with_token {
-        use dialoguer::Input;
-        let tok: String = Input::new()
-            .with_prompt("Paste PAT (stored 0600)")
-            .interact_text()?;
-        tok.trim().to_string()
+        prompt_pat()?
     } else {
         crate::oauth::login(
             crate::oauth::scope_for(&cfg.github),
