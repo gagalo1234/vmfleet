@@ -128,17 +128,36 @@ fn agent() -> ureq::Agent {
 /// production and `Duration::ZERO` in tests. Resolves the client id and base URL
 /// from env/const, then delegates to [`run_device_flow`].
 pub fn login(scope: &str, poll_delay: Duration) -> Result<String> {
-    run_device_flow(&agent(), &base(), &client_id()?, scope, poll_delay)
+    run_device_flow(&agent(), &base(), &client_id()?, scope, poll_delay, true)
+}
+
+/// Best-effort: open `url` in the user's default browser. Silent on failure — the
+/// URL is always printed too, so a headless/SSH host just uses that.
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        return; // `start` is a shell builtin, not an exe; the printed URL suffices
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// The device-flow state machine, with the base URL and client id passed in
 /// explicitly so tests can drive it against a fixture with no env dependence.
+/// `open` auto-launches the browser (true in production, false in tests).
 fn run_device_flow(
     agent: &ureq::Agent,
     base: &str,
     client_id: &str,
     scope: &str,
     poll_delay: Duration,
+    open: bool,
 ) -> Result<String> {
     // 1. request a device + user code
     let dc: DeviceCodeResp = agent
@@ -150,12 +169,18 @@ fn run_device_flow(
         .into_json()
         .context("parsing device-code response")?;
 
-    // 2. tell the user where to authorize
+    // 2. tell the user where to authorize, and open the browser for them
     println!("\n! First copy your one-time code: {}", dc.user_code);
-    println!(
-        "  Then open {} in a browser and enter it.",
-        dc.verification_uri
-    );
+    if open {
+        open_browser(&dc.verification_uri);
+        println!(
+            "  Opening {} in your browser — enter the code there.",
+            dc.verification_uri
+        );
+        println!("  (If nothing opened, visit that URL manually.)");
+    } else {
+        println!("  Then open {} and enter it.", dc.verification_uri);
+    }
     println!("  Waiting for authorization (scope: {scope})...");
 
     // 3. poll for the token
@@ -267,6 +292,7 @@ mod tests {
             "test-client",
             "repo",
             Duration::ZERO,
+            false,
         )
         .unwrap();
         assert_eq!(token, "gho_test_token");
@@ -275,7 +301,7 @@ mod tests {
     #[test]
     fn device_flow_reports_denied() {
         let fx = FixtureOAuth::start_error("access_denied");
-        let err = run_device_flow(&agent(), &fx.base_url, "c", "repo", Duration::ZERO)
+        let err = run_device_flow(&agent(), &fx.base_url, "c", "repo", Duration::ZERO, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("denied"), "unexpected error: {err}");

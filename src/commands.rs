@@ -435,15 +435,43 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         .default(0)
         .interact()?;
 
-    // 2. Which repo/org this fleet serves — also determines the least-privilege
-    //    device-flow scope (repo -> `repo`, org -> `admin:org`).
-    let scope: String = Input::new()
-        .with_prompt("GitHub repo (owner/name) or org (@org)")
-        .interact_text()?;
-    let (repo, org) = if let Some(o) = scope.strip_prefix('@') {
-        (None, Some(o.to_string()))
-    } else {
-        (Some(scope), None)
+    // 2. Fleet scope: repository vs organization (explicit choice), then the name
+    //    (format-validated), then a confirmation before continuing. This also fixes
+    //    the least-privilege device-flow scope (repo -> `repo`, org -> `admin:org`).
+    let (repo, org) = loop {
+        let is_repo = Select::new()
+            .with_prompt("Fleet scope")
+            .items(&["A single repository", "A whole organization"])
+            .default(0)
+            .interact()?
+            == 0;
+        let (repo, org, summary) = if is_repo {
+            let name: String = Input::new()
+                .with_prompt("Repository (owner/name)")
+                .validate_with(|s: &String| validate_repo(s))
+                .interact_text()?;
+            let name = name.trim().to_string();
+            let summary = format!("repository {name}");
+            (Some(name), None, summary)
+        } else {
+            let name: String = Input::new()
+                .with_prompt("Organization (login)")
+                .validate_with(|s: &String| validate_org(s))
+                .interact_text()?;
+            let name = name.trim().to_string();
+            let summary = format!("organization {name}");
+            (None, Some(name), summary)
+        };
+        let auth_scope = crate::oauth::scope_from_repo(repo.is_some());
+        if Confirm::new()
+            .with_prompt(format!(
+                "Continue with {summary}? (auth scope: {auth_scope})"
+            ))
+            .default(true)
+            .interact()?
+        {
+            break (repo, org);
+        }
     };
 
     // 3. Obtain + store the token per the chosen method (index 2 = reuse existing).
@@ -543,6 +571,26 @@ fn prompt_pat() -> Result<String> {
         .with_prompt("Paste PAT (stored 0600)")
         .interact_text()?;
     Ok(tok.trim().to_string())
+}
+
+/// Validate a repo-scope entry is `owner/name` (both parts non-empty, one slash).
+fn validate_repo(s: &str) -> std::result::Result<(), String> {
+    let parts: Vec<&str> = s.trim().split('/').collect();
+    if parts.len() == 2 && parts.iter().all(|p| !p.is_empty()) {
+        Ok(())
+    } else {
+        Err("expected owner/name, e.g. gagalo1234/vmfleet".into())
+    }
+}
+
+/// Validate an org-scope entry is a bare login (non-empty, no slash).
+fn validate_org(s: &str) -> std::result::Result<(), String> {
+    let s = s.trim();
+    if !s.is_empty() && !s.contains('/') {
+        Ok(())
+    } else {
+        Err("expected an organization login, e.g. my-org (no slash)".into())
+    }
 }
 
 /// Persist a token to `path` (creating its parent dir) with 0600 permissions.
@@ -747,4 +795,27 @@ fn build_one_base(mp: &Multipass, base: &Base, base_dir: &Path, force: bool) -> 
     }
     println!("base image `{}` ready", base.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_org, validate_repo};
+
+    #[test]
+    fn repo_entry_must_be_owner_slash_name() {
+        assert!(validate_repo("gagalo1234/vmfleet").is_ok());
+        assert!(validate_repo("  gagalo1234/vmfleet  ").is_ok());
+        assert!(validate_repo("vmfleet").is_err()); // no slash
+        assert!(validate_repo("a/b/c").is_err()); // too many parts
+        assert!(validate_repo("/vmfleet").is_err()); // empty owner
+        assert!(validate_repo("gagalo1234/").is_err()); // empty name
+    }
+
+    #[test]
+    fn org_entry_must_be_bare_login() {
+        assert!(validate_org("my-org").is_ok());
+        assert!(validate_org("  my-org  ").is_ok());
+        assert!(validate_org("").is_err());
+        assert!(validate_org("owner/name").is_err()); // slash => looks like a repo
+    }
 }
