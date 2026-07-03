@@ -60,6 +60,7 @@ image = "24.04"
     cfg.admission.psi_max = f64::MAX;
     cfg.admission.min_disk_gib = 0;
     cfg.supervisor.busy_reserve_mib = 1;
+    cfg.supervisor.update_check = false; // stay hermetic: no GitHub release check
     cfg.validate().unwrap();
     cfg
 }

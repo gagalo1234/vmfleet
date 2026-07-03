@@ -10,6 +10,7 @@ mod multipass;
 mod naming;
 mod paths;
 mod resources;
+mod selfupdate;
 mod supervisor;
 mod systemd;
 mod worker;
@@ -44,6 +45,7 @@ enum Cmd {
     /// Complete teardown of this fleet (VMs, runners, units; optionally config/base).
     Uninstall(UninstallArgs),
     /// Run the autoscaling control-plane loop (systemd ExecStart).
+    #[command(hide = true)]
     Supervisor {
         /// Run a single reconcile pass and exit instead of looping forever.
         #[arg(long)]
@@ -55,6 +57,7 @@ enum Cmd {
         dry_run: bool,
     },
     /// Run a single ephemeral VM worker for a pool+slot (spawned by the supervisor).
+    #[command(hide = true)]
     Worker { pool: String, slot: u32 },
     /// Show fleet status (pools, workers, host resources).
     Status,
@@ -65,8 +68,9 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Garbage-collect orphan VMs and stale runner records.
-    Gc,
+    /// Purge orphan VMs and stale runner records.
+    #[command(alias = "gc")]
+    Prune,
     /// Adjust a pool's min/max at runtime (writes config).
     Scale {
         pool: String,
@@ -76,7 +80,30 @@ enum Cmd {
         max: Option<u32>,
     },
     /// Validate the config file.
-    ConfigCheck,
+    #[command(alias = "config-check")]
+    Check,
+    /// Update vmfleet in place from the latest GitHub Release.
+    #[command(alias = "update")]
+    SelfUpdate(SelfUpdateArgs),
+}
+
+#[derive(clap::Args)]
+struct SelfUpdateArgs {
+    /// Report whether an update is available; do not download or install.
+    #[arg(long)]
+    check: bool,
+    /// Install a specific release tag (e.g. v0.2.0) instead of the latest.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Consider prerelease releases when choosing the latest.
+    #[arg(long)]
+    allow_prerelease: bool,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    yes: bool,
+    /// Swap the binary but do not migrate config / rewrite units / restart supervisor.
+    #[arg(long)]
+    no_restart: bool,
 }
 
 #[derive(clap::Args)]
@@ -124,7 +151,7 @@ fn run() -> Result<()> {
     let cfg_path = config_path(&cli);
 
     match &cli.cmd {
-        Cmd::ConfigCheck => {
+        Cmd::Check => {
             let cfg = config::Config::load(&cfg_path)?;
             println!(
                 "OK: {} — {} pool(s), scope {}",
@@ -136,7 +163,7 @@ fn run() -> Result<()> {
         }
         Cmd::Doctor => commands::doctor(&cfg_path),
         Cmd::Status => commands::status(&cfg_path),
-        Cmd::Gc => commands::gc(&cfg_path),
+        Cmd::Prune => commands::gc(&cfg_path),
         Cmd::Scale { pool, min, max } => commands::scale(&cfg_path, pool, *min, *max),
         Cmd::BuildBase { force } => commands::build_base(&cfg_path, *force),
         Cmd::Install(a) => commands::install(
@@ -162,5 +189,15 @@ fn run() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             worker::run(&cfg, pool, *slot)
         }
+        Cmd::SelfUpdate(a) => selfupdate::run(
+            &cfg_path,
+            &selfupdate::Opts {
+                check: a.check,
+                tag: a.tag.clone(),
+                allow_prerelease: a.allow_prerelease,
+                yes: a.yes,
+                no_restart: a.no_restart,
+            },
+        ),
     }
 }

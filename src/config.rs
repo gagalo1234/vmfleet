@@ -294,12 +294,23 @@ pub struct Supervisor {
     /// cost). Between refreshes the last result is reused.
     #[serde(default = "d_queued_every")]
     pub queued_poll_every: u32,
+    /// Periodically check GitHub Releases and surface when a newer vmfleet is
+    /// available (status.json + Prometheus gauge + a one-time log). Notify only —
+    /// never auto-installs. Run `vmfleet self-update` to apply.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+    /// How often to run the passive update check.
+    #[serde(default = "d_update_interval")]
+    pub update_check_interval_hours: u64,
 }
 fn d_sup_poll() -> u64 {
     15
 }
 fn d_queued_every() -> u32 {
     4
+}
+fn d_update_interval() -> u64 {
+    24
 }
 fn d_idle_timeout() -> u64 {
     900
@@ -319,6 +330,8 @@ impl Default for Supervisor {
             busy_reserve_mib: d_busy_reserve(),
             use_jit: default_true(),
             queued_poll_every: d_queued_every(),
+            update_check: default_true(),
+            update_check_interval_hours: d_update_interval(),
         }
     }
 }

@@ -66,7 +66,7 @@ that retries `acquirejob` forever.
 ## Namespacing / safety
 
 Everything created is prefixed `vmfleet-` (VMs `vmfleet-<pool>-<slot>-<ts>-<pid>`,
-units `vmfleet-worker-<slot>` / `vmfleet-supervisor`). Cleanup and `gc` only ever
+units `vmfleet-worker-<slot>` / `vmfleet-supervisor`). Cleanup and `prune` only ever
 act on this prefix, so vmfleet can never purge VMs/runners it doesn't own.
 
 ## Testability
