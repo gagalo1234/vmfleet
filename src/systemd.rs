@@ -193,30 +193,7 @@ impl<'a> Systemd<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::{CmdOut, Runner};
-    use std::sync::Mutex;
-
-    /// Records every (program, args) invocation so tests can assert the exact
-    /// command sequence a `Systemd` method emits. `Mutex` (not `RefCell`) so it
-    /// satisfies the `Runner: Send + Sync` bound.
-    #[derive(Default)]
-    struct MockRunner {
-        calls: Mutex<Vec<(String, Vec<String>)>>,
-    }
-
-    impl Runner for MockRunner {
-        fn run(&self, program: &str, args: &[&str], _timeout: Option<Duration>) -> Result<CmdOut> {
-            self.calls.lock().unwrap().push((
-                program.to_string(),
-                args.iter().map(|s| s.to_string()).collect(),
-            ));
-            Ok(CmdOut {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }
-    }
+    use crate::testsupport::RecordingRunner;
 
     // Regression test for the slot-wedge bug: a worker that exited non-zero left a
     // `failed` transient unit, and `systemd-run --unit=<same>` was then rejected,
@@ -224,7 +201,7 @@ mod tests {
     // a defensive `reset-failed`. Lock both in so the wedge can't silently return.
     #[test]
     fn run_transient_collects_and_resets_before_launch() {
-        let mock = MockRunner::default();
+        let mock = RecordingRunner::default();
         let sd = Systemd::new(&mock);
         let setenvs = vec![("KEY".to_string(), "VAL".to_string())];
         sd.run_transient(
@@ -235,7 +212,7 @@ mod tests {
         )
         .unwrap();
 
-        let calls = mock.calls.lock().unwrap();
+        let calls = mock.calls();
         assert_eq!(calls.len(), 2, "expected reset-failed then systemd-run");
 
         // Assert the exact command + argument vector (not mere presence), so a
@@ -273,11 +250,11 @@ mod tests {
 
     #[test]
     fn stop_stops_then_resets_failed() {
-        let mock = MockRunner::default();
+        let mock = RecordingRunner::default();
         let sd = Systemd::new(&mock);
         sd.stop("vmfleet-worker-102.service").unwrap();
 
-        let calls = mock.calls.lock().unwrap();
+        let calls = mock.calls();
         assert_eq!(calls.len(), 2);
         // Exact command + args: stop, then reset-failed, both on the user manager.
         assert_eq!(calls[0].0, "systemctl");

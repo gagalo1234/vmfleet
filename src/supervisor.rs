@@ -30,40 +30,50 @@ pub fn headroom_vms(avail_mib: u64, min_avail_mib: u64, busy_reserve_mib: u64) -
     (free / busy_reserve_mib.max(1)) as u32
 }
 
-#[derive(Serialize)]
-struct PoolReport {
-    name: String,
-    idle: u32,
-    busy: u32,
-    queued: u32,
-    active_units: u32,
-    pending: u32,
-    present: u32,
-    desired: u32,
-    deficit: i64,
-    actions: Vec<String>,
+// `pub` (crate-visible in this bin) + `Clone` so reconcile can hand the decision
+// back to callers — the dry-run path and the offline e2e test both inspect it.
+#[derive(Serialize, Clone)]
+pub struct PoolReport {
+    pub name: String,
+    pub idle: u32,
+    pub busy: u32,
+    pub queued: u32,
+    pub active_units: u32,
+    pub pending: u32,
+    pub present: u32,
+    pub desired: u32,
+    pub deficit: i64,
+    pub actions: Vec<String>,
 }
-#[derive(Serialize)]
-struct Report {
-    ts: u64,
+// `pub` (crate-visible in this bin) + `Clone` so reconcile can hand the decision
+// back to callers — the dry-run path and the offline e2e test both inspect it.
+#[derive(Serialize, Clone)]
+pub struct Report {
+    pub ts: u64,
     /// Running vmfleet version (from CARGO_PKG_VERSION).
-    version: String,
-    mem_avail_mib: u64,
-    psi: f64,
-    disk_free_gib: u64,
-    blocked: Option<String>,
-    headroom_vms: u32,
-    pools: Vec<PoolReport>,
+    pub version: String,
+    pub mem_avail_mib: u64,
+    pub psi: f64,
+    pub disk_free_gib: u64,
+    pub blocked: Option<String>,
+    pub headroom_vms: u32,
+    pub pools: Vec<PoolReport>,
     /// A newer published release is available (passive check; notify only).
-    update_available: bool,
+    pub update_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    latest_version: Option<String>,
+    pub latest_version: Option<String>,
 }
 
-pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
+pub fn run(cfg: &Config, cfg_path: &Path, once: bool, dry_run: bool) -> Result<()> {
     // Single-instance guard: refuse to start a second supervisor (which would
-    // double-provision). Held for the process lifetime.
-    let _singleton = acquire_singleton()?;
+    // double-provision). Held for the process lifetime. A dry run performs no
+    // side effects, so it deliberately skips the guard and can preview decisions
+    // alongside the live supervisor.
+    let _singleton = if dry_run {
+        None
+    } else {
+        Some(acquire_singleton()?)
+    };
     let runner = SystemRunner::new();
     let sd = Systemd::new(&runner);
     let client = Client::new(&cfg.github, cfg.token()?)?;
@@ -86,8 +96,25 @@ pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
     );
 
     loop {
-        if let Err(e) = reconcile(cfg, cfg_path, &client, &sd, &gate, &exe, &mut state) {
-            tracing::warn!("reconcile error: {e:#}");
+        match reconcile(
+            cfg, cfg_path, &client, &sd, &gate, &exe, &mut state, dry_run,
+        ) {
+            Ok(report) if dry_run => {
+                // Preview mode: emit the decision the supervisor would act on.
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A one-off run must surface failures as a non-zero exit (scripts,
+                // live-smoke). The daemon loop instead logs and rides out the blip.
+                if once {
+                    return Err(e);
+                }
+                tracing::warn!("reconcile error: {e:#}");
+            }
+        }
+        if once {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_secs(cfg.supervisor.poll_seconds.max(1)));
     }
@@ -121,6 +148,9 @@ pub struct SupState {
 }
 
 /// One reconcile pass. Public-in-crate so `status` can render a live view too.
+// Orchestration entry point: it genuinely needs all of the fleet's collaborators
+// (config, GitHub client, systemd, admission gate, state) plus the dry-run mode.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     cfg: &Config,
     cfg_path: &Path,
@@ -129,18 +159,18 @@ pub fn reconcile(
     gate: &admission::Gate,
     exe: &Path,
     state: &mut SupState,
-) -> Result<()> {
-    let runners = match client.list_runners() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("github list_runners failed (transient), skipping cycle: {e}");
-            return Ok(());
-        }
-    };
+    dry_run: bool,
+) -> Result<Report> {
+    // A GitHub API failure aborts the whole cycle. The daemon loop logs it and
+    // retries on the next poll; `--once`/dry-run surface it as a non-zero exit
+    // rather than a misleading empty report.
+    let runners = client.list_runners()?;
     // Recover any worker units left in `failed` state (else systemd-run can't
     // reuse the slot name). reset_failed is also called just-in-time at launch.
-    for u in sd.list_failed(naming::WORKER_UNIT_GLOB) {
-        sd.reset_failed(&u);
+    if !dry_run {
+        for u in sd.list_failed(naming::WORKER_UNIT_GLOB) {
+            sd.reset_failed(&u);
+        }
     }
     // Throttle the expensive (N+1) queued-jobs scan: only every Nth cycle.
     let every = cfg.supervisor.queued_poll_every.max(1) as u64;
@@ -218,6 +248,14 @@ pub fn reconcile(
             let mut free: Vec<u32> = pool_slots.difference(&active).copied().collect();
             free.sort_unstable();
             for slot in free.into_iter().take(can as usize) {
+                if dry_run {
+                    // Record the intended launch and advance the same counters the
+                    // real path would, so later pools/slots see a realistic budget.
+                    actions.push(format!("launch:{slot}"));
+                    launched_this_cycle += 1;
+                    headroom = headroom.saturating_sub(1);
+                    continue;
+                }
                 match launch(sd, exe, cfg_path, pool, slot) {
                     Ok(_) => {
                         actions.push(format!("launch:{slot}"));
@@ -255,7 +293,9 @@ pub fn reconcile(
                     .map(|t| t.elapsed() >= idle_timeout)
                     .unwrap_or(false);
                 if long_idle {
-                    let _ = sd.stop(&naming::worker_unit(slot));
+                    if !dry_run {
+                        let _ = sd.stop(&naming::worker_unit(slot));
+                    }
                     actions.push(format!("stop:{slot}"));
                     excess -= 1;
                 }
@@ -279,7 +319,9 @@ pub fn reconcile(
     // Passive update check: surface (never auto-install) a newer release. Runs in a
     // background thread and hands the result back via a channel, so the network call
     // (up to ~40s with timeouts/retries) can never block or stall this reconcile loop.
-    if cfg.supervisor.update_check {
+    // Skipped under dry-run: a preview must stay side-effect-free and offline (no
+    // background network check spawned from a one-shot `--once --dry-run`).
+    if cfg.supervisor.update_check && !dry_run {
         maybe_update_check(cfg, state);
     }
 
@@ -302,9 +344,13 @@ pub fn reconcile(
         update_available: state.latest_version.is_some(),
         latest_version: state.latest_version.clone(),
     };
-    write_status(&report);
-    write_metrics(&report);
-    Ok(())
+    if !dry_run {
+        write_status(&report);
+        write_metrics(&report);
+    }
+    // Dry runs leave the live status/metrics files (owned by any running
+    // supervisor) untouched; the caller prints the returned report instead.
+    Ok(report)
 }
 
 /// Write a Prometheus textfile-collector file next to status.json.

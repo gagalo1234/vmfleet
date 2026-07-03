@@ -60,6 +60,11 @@ jobs:
 | `vmfleet uninstall [--purge-all]` | Stop the fleet; remove VMs/runners/units (+config/base) |
 | `vmfleet supervisor` / `worker` | Internal: run by systemd; not called by hand |
 
+Preview what the control loop would do right now, without touching the fleet:
+`vmfleet supervisor --once --dry-run` prints one reconcile decision as JSON (safe to
+run alongside the live supervisor). See [docs/TESTING.md](docs/TESTING.md) and the
+dev loop in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ## Updating
 
 ```bash
