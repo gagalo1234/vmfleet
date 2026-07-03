@@ -29,6 +29,12 @@ impl<'a> Systemd<'a> {
             "--user".into(),
             format!("--unit={unit}"),
             "--quiet".into(),
+            // Garbage-collect the unit even if it exits non-zero (CollectMode=
+            // inactive-or-failed). Without this a failed worker leaves a lingering
+            // `failed` unit and systemd-run refuses to reuse the name, wedging the
+            // slot. This is the primary, systemd-native defense; reset_failed below
+            // is belt-and-suspenders for units left over from an older binary.
+            "--collect".into(),
             "-p".into(),
             "KillMode=control-group".into(),
             "-p".into(),
@@ -40,9 +46,9 @@ impl<'a> Systemd<'a> {
         args.push(program.to_string());
         args.extend(prog_args.iter().cloned());
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        // A prior worker that exited non-zero leaves the transient unit in a
-        // `failed` state, and systemd-run refuses to reuse the name. Clear it
-        // first (idempotent, ignore errors) so the slot never wedges.
+        // Belt-and-suspenders: clear any pre-existing `failed` state for this unit
+        // name (idempotent, ignore errors) so the slot never wedges even if a prior
+        // unit was created without --collect.
         self.reset_failed(unit);
         checked(self.r, "systemd-run", &refs, Some(Duration::from_secs(30)))?;
         Ok(())
@@ -181,5 +187,89 @@ impl<'a> Systemd<'a> {
             )
             .map(|o| o.stdout.trim() == "yes")
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::{CmdOut, Runner};
+    use std::sync::Mutex;
+
+    /// Records every (program, args) invocation so tests can assert the exact
+    /// command sequence a `Systemd` method emits. `Mutex` (not `RefCell`) so it
+    /// satisfies the `Runner: Send + Sync` bound.
+    #[derive(Default)]
+    struct MockRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl Runner for MockRunner {
+        fn run(&self, program: &str, args: &[&str], _timeout: Option<Duration>) -> Result<CmdOut> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            Ok(CmdOut {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    // Regression test for the slot-wedge bug: a worker that exited non-zero left a
+    // `failed` transient unit, and `systemd-run --unit=<same>` was then rejected,
+    // wedging the slot forever. The fix is `--collect` (auto-GC failed units) plus
+    // a defensive `reset-failed`. Lock both in so the wedge can't silently return.
+    #[test]
+    fn run_transient_collects_and_resets_before_launch() {
+        let mock = MockRunner::default();
+        let sd = Systemd::new(&mock);
+        let setenvs = vec![("KEY".to_string(), "VAL".to_string())];
+        sd.run_transient(
+            "vmfleet-worker-101.service",
+            &setenvs,
+            "/usr/bin/vmfleet",
+            &["worker".to_string(), "101".to_string()],
+        )
+        .unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected reset-failed then systemd-run");
+
+        // 1) reset-failed clears any stale failed unit first.
+        let (prog0, args0) = &calls[0];
+        assert_eq!(prog0, "systemctl");
+        assert!(args0.iter().any(|a| a == "reset-failed"));
+        assert!(args0.iter().any(|a| a == "vmfleet-worker-101.service"));
+
+        // 2) systemd-run must carry --collect so a failed unit is auto-GC'd, plus
+        //    the unit name, env, program and its args.
+        let (prog1, args1) = &calls[1];
+        assert_eq!(prog1, "systemd-run");
+        assert!(
+            args1.iter().any(|a| a == "--collect"),
+            "must pass --collect"
+        );
+        assert!(args1
+            .iter()
+            .any(|a| a == "--unit=vmfleet-worker-101.service"));
+        assert!(args1.iter().any(|a| a == "--setenv=KEY=VAL"));
+        assert!(args1.iter().any(|a| a == "/usr/bin/vmfleet"));
+        assert!(args1.iter().any(|a| a == "worker"));
+        assert!(args1.iter().any(|a| a == "101"));
+    }
+
+    #[test]
+    fn stop_stops_then_resets_failed() {
+        let mock = MockRunner::default();
+        let sd = Systemd::new(&mock);
+        sd.stop("vmfleet-worker-102.service").unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.iter().any(|a| a == "stop"));
+        assert!(calls[1].1.iter().any(|a| a == "reset-failed"));
     }
 }
