@@ -1,0 +1,116 @@
+name: release
+
+# Trunk-based release (team-git-workflow.md §6): pushing a vX.Y.Z tag builds the
+# cross-platform binaries and stages them in a DRAFT GitHub Release. Publication is a
+# separate, human-gated step — see promote.yml. A tag alone never ships to production.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Release health checks (§6): fail before spending time on the build matrix.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: version matches tag
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          tag_base="${tag_version%%-*}"   # strip prerelease suffix (e.g. -rc.1)
+          if [ "$cargo_version" != "$tag_base" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (base $tag_base) != Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "version ok: $cargo_version"
+      - name: tag is reachable from origin/main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tagged commit $GITHUB_SHA is not an ancestor of origin/main"
+            echo "::error::release tags must point at a commit already merged to main (§6/§7)"
+            exit 1
+          fi
+          echo "ancestry ok"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          pkg="vmfleet-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${{ matrix.target }}/release/vmfleet" "dist/${pkg}/"
+          cp README.md LICENSE "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          ( cd dist && sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
+          rm -rf "dist/${pkg}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create/update the (draft) GitHub Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true                       # published later by promote.yml
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
