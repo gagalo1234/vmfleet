@@ -238,27 +238,39 @@ mod tests {
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "expected reset-failed then systemd-run");
 
-        // 1) reset-failed clears any stale failed unit first.
-        let (prog0, args0) = &calls[0];
-        assert_eq!(prog0, "systemctl");
-        assert!(args0.iter().any(|a| a == "reset-failed"));
-        assert!(args0.iter().any(|a| a == "vmfleet-worker-101.service"));
+        // Assert the exact command + argument vector (not mere presence), so a
+        // dropped `--user` (which would target the system manager instead of the
+        // user manager) or a reordered flag is caught as a regression.
 
-        // 2) systemd-run must carry --collect so a failed unit is auto-GC'd, plus
-        //    the unit name, env, program and its args.
-        let (prog1, args1) = &calls[1];
-        assert_eq!(prog1, "systemd-run");
-        assert!(
-            args1.iter().any(|a| a == "--collect"),
-            "must pass --collect"
+        // 1) reset-failed clears any stale failed unit first.
+        assert_eq!(calls[0].0, "systemctl");
+        let args0: Vec<&str> = calls[0].1.iter().map(String::as_str).collect();
+        assert_eq!(
+            args0,
+            ["--user", "reset-failed", "vmfleet-worker-101.service"]
         );
-        assert!(args1
-            .iter()
-            .any(|a| a == "--unit=vmfleet-worker-101.service"));
-        assert!(args1.iter().any(|a| a == "--setenv=KEY=VAL"));
-        assert!(args1.iter().any(|a| a == "/usr/bin/vmfleet"));
-        assert!(args1.iter().any(|a| a == "worker"));
-        assert!(args1.iter().any(|a| a == "101"));
+
+        // 2) systemd-run must carry --collect (auto-GC failed units) in exact
+        //    order, with the unit name, env, program and its args.
+        assert_eq!(calls[1].0, "systemd-run");
+        let args1: Vec<&str> = calls[1].1.iter().map(String::as_str).collect();
+        assert_eq!(
+            args1,
+            [
+                "--user",
+                "--unit=vmfleet-worker-101.service",
+                "--quiet",
+                "--collect",
+                "-p",
+                "KillMode=control-group",
+                "-p",
+                "TimeoutStopSec=120",
+                "--setenv=KEY=VAL",
+                "/usr/bin/vmfleet",
+                "worker",
+                "101",
+            ]
+        );
     }
 
     #[test]
@@ -269,7 +281,15 @@ mod tests {
 
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert!(calls[0].1.iter().any(|a| a == "stop"));
-        assert!(calls[1].1.iter().any(|a| a == "reset-failed"));
+        // Exact command + args: stop, then reset-failed, both on the user manager.
+        assert_eq!(calls[0].0, "systemctl");
+        let stop_args: Vec<&str> = calls[0].1.iter().map(String::as_str).collect();
+        assert_eq!(stop_args, ["--user", "stop", "vmfleet-worker-102.service"]);
+        assert_eq!(calls[1].0, "systemctl");
+        let reset_args: Vec<&str> = calls[1].1.iter().map(String::as_str).collect();
+        assert_eq!(
+            reset_args,
+            ["--user", "reset-failed", "vmfleet-worker-102.service"]
+        );
     }
 }
