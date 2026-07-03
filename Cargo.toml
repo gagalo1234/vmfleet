@@ -23,6 +23,11 @@ dialoguer = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
+# self-update: verify release checksums, unpack tarballs, swap the running binary.
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+self-replace = "1"
 
 [profile.release]
 strip = true
