@@ -244,18 +244,16 @@ mod tests {
 
         // 1) reset-failed clears any stale failed unit first.
         assert_eq!(calls[0].0, "systemctl");
-        let args0: Vec<&str> = calls[0].1.iter().map(String::as_str).collect();
         assert_eq!(
-            args0,
+            calls[0].1,
             ["--user", "reset-failed", "vmfleet-worker-101.service"]
         );
 
         // 2) systemd-run must carry --collect (auto-GC failed units) in exact
         //    order, with the unit name, env, program and its args.
         assert_eq!(calls[1].0, "systemd-run");
-        let args1: Vec<&str> = calls[1].1.iter().map(String::as_str).collect();
         assert_eq!(
-            args1,
+            calls[1].1,
             [
                 "--user",
                 "--unit=vmfleet-worker-101.service",
@@ -283,12 +281,10 @@ mod tests {
         assert_eq!(calls.len(), 2);
         // Exact command + args: stop, then reset-failed, both on the user manager.
         assert_eq!(calls[0].0, "systemctl");
-        let stop_args: Vec<&str> = calls[0].1.iter().map(String::as_str).collect();
-        assert_eq!(stop_args, ["--user", "stop", "vmfleet-worker-102.service"]);
+        assert_eq!(calls[0].1, ["--user", "stop", "vmfleet-worker-102.service"]);
         assert_eq!(calls[1].0, "systemctl");
-        let reset_args: Vec<&str> = calls[1].1.iter().map(String::as_str).collect();
         assert_eq!(
-            reset_args,
+            calls[1].1,
             ["--user", "reset-failed", "vmfleet-worker-102.service"]
         );
     }
