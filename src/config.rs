@@ -10,14 +10,39 @@ fn default_true() -> bool {
     true
 }
 
+/// Current config schema version.
+pub const CURRENT_VERSION: u32 = 1;
+fn d_version() -> u32 {
+    CURRENT_VERSION
+}
+
+/// Apply forward migrations to a parsed config. Returns true if it changed.
+/// (Only v1 exists today; this is the framework for future bumps.)
+pub fn migrate(cfg: &mut Config) -> bool {
+    let mut changed = false;
+    // Example future step:
+    // if cfg.version < 2 { ...migrate...; cfg.version = 2; changed = true; }
+    if cfg.version < CURRENT_VERSION {
+        cfg.version = CURRENT_VERSION;
+        changed = true;
+    }
+    changed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Config schema version (for `install --upgrade` migrations).
+    #[serde(default = "d_version")]
+    pub version: u32,
     pub github: GitHub,
     #[serde(default)]
     pub storage: Storage,
     #[serde(default)]
     pub admission: Admission,
-    pub base: Base,
+    /// One or more base images. Pools clone from their referenced base (or the
+    /// first one). Written as `[[base]]` tables.
+    #[serde(rename = "base")]
+    pub bases: Vec<Base>,
     #[serde(rename = "pool")]
     pub pools: Vec<Pool>,
     #[serde(default)]
@@ -230,6 +255,10 @@ pub struct Pool {
     pub max: u32,
     /// Base slot number for this pool (VM/unit slots are slot_base..slot_base+max).
     pub slot_base: u32,
+    /// Which `[[base]]` image this pool clones from (by name). Defaults to the
+    /// first base. Lets a small pool use a smaller-disk base than a large one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 impl Pool {
@@ -253,9 +282,16 @@ pub struct Supervisor {
     pub busy_reserve_mib: u64,
     #[serde(default = "default_true")]
     pub use_jit: bool,
+    /// Query queued jobs only every Nth reconcile cycle (throttles the N+1 API
+    /// cost). Between refreshes the last result is reused.
+    #[serde(default = "d_queued_every")]
+    pub queued_poll_every: u32,
 }
 fn d_sup_poll() -> u64 {
     15
+}
+fn d_queued_every() -> u32 {
+    4
 }
 fn d_idle_timeout() -> u64 {
     900
@@ -274,6 +310,7 @@ impl Default for Supervisor {
             max_launch_per_poll: d_max_launch(),
             busy_reserve_mib: d_busy_reserve(),
             use_jit: default_true(),
+            queued_poll_every: d_queued_every(),
         }
     }
 }
@@ -282,14 +319,33 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config =
+        let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        // Expand ~ / $HOME in config-supplied paths (TOML keeps them literal).
+        cfg.github.token_file = crate::paths::expand(&cfg.github.token_file);
+        cfg.storage.vault_path = crate::paths::expand(&cfg.storage.vault_path);
+        for b in &mut cfg.bases {
+            b.setup_scripts = b
+                .setup_scripts
+                .iter()
+                .map(|p| crate::paths::expand(p))
+                .collect();
+        }
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<()> {
         self.github.scope_path()?; // repo xor org
+        if self.bases.is_empty() {
+            bail!("config: at least one [[base]] is required");
+        }
+        let mut base_names = std::collections::HashSet::new();
+        for b in &self.bases {
+            if !base_names.insert(b.name.clone()) {
+                bail!("duplicate base name `{}`", b.name);
+            }
+        }
         if self.pools.is_empty() {
             bail!("config: at least one [[pool]] is required");
         }
@@ -313,6 +369,15 @@ impl Config {
             }
             if !seen_names.insert(p.name.clone()) {
                 bail!("duplicate pool name `{}`", p.name);
+            }
+            if let Some(bn) = &p.base {
+                if !base_names.contains(bn) {
+                    bail!(
+                        "pool `{}`: base `{}` not defined in any [[base]]",
+                        p.name,
+                        bn
+                    );
+                }
             }
             ranges.push((p.slot_base, p.slot_base + p.max, &p.name));
         }
@@ -340,6 +405,18 @@ impl Config {
             .ok_or_else(|| anyhow!("no pool named `{name}`"))
     }
 
+    /// The base image a pool clones from: its referenced `base`, else the first.
+    pub fn base_for(&self, pool: &Pool) -> &Base {
+        match &pool.base {
+            Some(n) => self
+                .bases
+                .iter()
+                .find(|b| &b.name == n)
+                .unwrap_or(&self.bases[0]),
+            None => &self.bases[0],
+        }
+    }
+
     /// Read the token from VMFLEET_TOKEN env or the configured token_file.
     pub fn token(&self) -> Result<String> {
         if let Ok(t) = std::env::var("VMFLEET_TOKEN") {
@@ -363,8 +440,14 @@ mod tests {
 repo = "owner/name"
 token_file = "/tmp/tok"
 
-[base]
+[[base]]
+name = "vmfleet-base"
 image = "24.04"
+
+[[base]]
+name = "vmfleet-base-small"
+image = "24.04"
+disk = "30G"
 
 [[pool]]
 name = "small"
@@ -374,6 +457,7 @@ memory = "4GiB"
 min_warm = 2
 max = 10
 slot_base = 101
+base = "vmfleet-base-small"
 
 [[pool]]
 name = "large"
@@ -394,6 +478,22 @@ slot_base = 201
         assert_eq!(cfg.github.scope_path().unwrap(), "repos/owner/name");
         assert_eq!(cfg.pool("small").unwrap().slots(), 101..111);
         assert!(cfg.supervisor.use_jit);
+        // per-pool base resolution
+        assert_eq!(
+            cfg.base_for(cfg.pool("small").unwrap()).name,
+            "vmfleet-base-small"
+        );
+        assert_eq!(
+            cfg.base_for(cfg.pool("large").unwrap()).name,
+            "vmfleet-base"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_pool_base() {
+        let mut cfg: Config = toml::from_str(sample()).unwrap();
+        cfg.pools[0].base = Some("nope".into());
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

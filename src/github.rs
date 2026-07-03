@@ -8,7 +8,7 @@ use crate::config::GitHub;
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API_VERSION: &str = "2022-11-28";
 const RETRIES: u32 = 3;
@@ -78,27 +78,54 @@ impl Client {
         format!("{}/{}/{}", self.api_base, self.scope, tail)
     }
 
-    fn get_json<T: for<'de> Deserialize<'de>>(&self, tail: &str) -> Result<T> {
-        let url = self.url(tail);
+    fn headers(&self, req: ureq::Request) -> ureq::Request {
+        req.set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", API_VERSION)
+            .set("User-Agent", "vmfleet")
+    }
+
+    /// Send with retry + GitHub rate-limit backoff. `body` None => GET, Some => POST.
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<ureq::Response> {
         let mut last = anyhow!("no attempt");
         for attempt in 1..=RETRIES {
-            match self
-                .agent
-                .get(&url)
-                .set("Authorization", &format!("Bearer {}", self.token))
-                .set("Accept", "application/vnd.github+json")
-                .set("X-GitHub-Api-Version", API_VERSION)
-                .set("User-Agent", "vmfleet")
-                .call()
-            {
-                Ok(resp) => return Ok(resp.into_json::<T>()?),
+            let req = self.headers(self.agent.request(method, url));
+            let res = match body {
+                Some(b) => req.send_json(b.clone()),
+                None => req.call(),
+            };
+            match res {
+                Ok(resp) => return Ok(resp),
+                // primary/secondary rate limit: honor Retry-After / X-RateLimit-Reset
+                Err(ureq::Error::Status(code, resp)) if code == 403 || code == 429 => {
+                    let wait = rate_limit_wait(&resp).unwrap_or(2 * attempt as u64).min(60);
+                    tracing::warn!("github {code} (rate limit) on {url}; waiting {wait}s");
+                    last = anyhow!("{method} {url}: {code} rate-limited");
+                    std::thread::sleep(Duration::from_secs(wait));
+                }
+                Err(ureq::Error::Status(code, _)) if code >= 500 => {
+                    last = anyhow!("{method} {url}: HTTP {code}");
+                    std::thread::sleep(Duration::from_secs(2 * attempt as u64));
+                }
+                Err(ureq::Error::Status(code, _)) => {
+                    return Err(anyhow!("{method} {url}: HTTP {code}"))
+                }
                 Err(e) => {
-                    last = anyhow!("GET {tail} attempt {attempt}/{RETRIES}: {e}");
+                    last = anyhow!("{method} {url} attempt {attempt}/{RETRIES}: {e}");
                     std::thread::sleep(Duration::from_secs(2 * attempt as u64));
                 }
             }
         }
         Err(last)
+    }
+
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, tail: &str) -> Result<T> {
+        Ok(self.send("GET", &self.url(tail), None)?.into_json::<T>()?)
     }
 
     fn post_json<T: for<'de> Deserialize<'de>>(
@@ -106,26 +133,9 @@ impl Client {
         tail: &str,
         body: serde_json::Value,
     ) -> Result<T> {
-        let url = self.url(tail);
-        let mut last = anyhow!("no attempt");
-        for attempt in 1..=RETRIES {
-            match self
-                .agent
-                .post(&url)
-                .set("Authorization", &format!("Bearer {}", self.token))
-                .set("Accept", "application/vnd.github+json")
-                .set("X-GitHub-Api-Version", API_VERSION)
-                .set("User-Agent", "vmfleet")
-                .send_json(body.clone())
-            {
-                Ok(resp) => return Ok(resp.into_json::<T>()?),
-                Err(e) => {
-                    last = anyhow!("POST {tail} attempt {attempt}/{RETRIES}: {e}");
-                    std::thread::sleep(Duration::from_secs(2 * attempt as u64));
-                }
-            }
-        }
-        Err(last)
+        Ok(self
+            .send("POST", &self.url(tail), Some(&body))?
+            .into_json::<T>()?)
     }
 
     /// Liveness/auth probe: list runners once.
@@ -133,9 +143,21 @@ impl Client {
         self.list_runners().map(|_| ())
     }
 
+    /// List all runners, following `Link: rel="next"` pagination (>100 runners).
     pub fn list_runners(&self) -> Result<Vec<Runner>> {
-        let r: RunnersResp = self.get_json("actions/runners?per_page=100")?;
-        Ok(r.runners)
+        let mut out = Vec::new();
+        let mut url = self.url("actions/runners?per_page=100");
+        loop {
+            let resp = self.send("GET", &url, None)?;
+            let next = next_link(resp.header("link"));
+            let page: RunnersResp = resp.into_json()?;
+            out.extend(page.runners);
+            match next {
+                Some(n) => url = n,
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     pub fn registration_token(&self) -> Result<String> {
@@ -249,4 +271,57 @@ pub fn check_token(gh: &GitHub, token: &str) -> Result<()> {
         bail!("token looks too short");
     }
     Ok(())
+}
+
+/// Seconds to wait given a rate-limited response: Retry-After, else
+/// X-RateLimit-Reset (epoch) minus now.
+fn rate_limit_wait(resp: &ureq::Response) -> Option<u64> {
+    if let Some(ra) = resp
+        .header("retry-after")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Some(ra);
+    }
+    if resp.header("x-ratelimit-remaining").map(|s| s.trim()) == Some("0") {
+        let reset = resp
+            .header("x-ratelimit-reset")?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        return Some(reset.saturating_sub(now));
+    }
+    None
+}
+
+/// Extract the `rel="next"` URL from a Link header, if present.
+fn next_link(link: Option<&str>) -> Option<String> {
+    let link = link?;
+    for part in link.split(',') {
+        if part.contains("rel=\"next\"") {
+            let seg = part.split(';').next()?.trim();
+            return Some(
+                seg.trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_next_link() {
+        let h = "<https://api.github.com/x?page=2>; rel=\"next\", <https://api.github.com/x?page=5>; rel=\"last\"";
+        assert_eq!(
+            next_link(Some(h)),
+            Some("https://api.github.com/x?page=2".to_string())
+        );
+        assert_eq!(next_link(Some("<https://x>; rel=\"last\"")), None);
+        assert_eq!(next_link(None), None);
+    }
 }

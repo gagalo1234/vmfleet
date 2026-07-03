@@ -134,11 +134,9 @@ fn lifecycle(cfg: &Config, pool: &Pool, pool_name: &str, slot: u32, ctx: &Arc<Ct
     if !mp.available() {
         bail!("multipass daemon not available");
     }
-    if !mp.exists(&cfg.base.name) {
-        bail!(
-            "base VM does not exist: {} (run `vmfleet build-base`)",
-            cfg.base.name
-        );
+    let base_name = cfg.base_for(pool).name.clone();
+    if !mp.exists(&base_name) {
+        bail!("base VM does not exist: {base_name} (run `vmfleet build-base`)");
     }
     ctx.github.reachable().context("GitHub not reachable")?;
 
@@ -167,7 +165,7 @@ fn lifecycle(cfg: &Config, pool: &Pool, pool_name: &str, slot: u32, ctx: &Arc<Ct
     let guard = gate.acquire()?;
     tracing::info!("admission granted for {}", ctx.vm_name);
 
-    mp.clone_from(&cfg.base.name, &ctx.vm_name)?;
+    mp.clone_from(&base_name, &ctx.vm_name)?;
     ctx.created.store(true, Ordering::SeqCst);
     mp.set_cpus(&ctx.vm_name, pool.cpus)?;
     mp.set_memory(&ctx.vm_name, &pool.memory)?;

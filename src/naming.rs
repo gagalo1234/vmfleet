@@ -21,6 +21,8 @@ pub fn worker_unit(slot: u32) -> String {
 
 pub const WORKER_UNIT_GLOB: &str = "vmfleet-worker-*.service";
 pub const SUPERVISOR_UNIT: &str = "vmfleet-supervisor.service";
+pub const GC_SERVICE: &str = "vmfleet-gc.service";
+pub const GC_TIMER: &str = "vmfleet-gc.timer";
 
 /// Extract the slot number from a VM name given its owning pool.
 /// vmfleet-<pool>-<slot>-... -> slot

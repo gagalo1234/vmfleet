@@ -55,6 +55,9 @@ struct Report {
 }
 
 pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
+    // Single-instance guard: refuse to start a second supervisor (which would
+    // double-provision). Held for the process lifetime.
+    let _singleton = acquire_singleton()?;
     let runner = SystemRunner::new();
     let sd = Systemd::new(&runner);
     let client = Client::new(&cfg.github, cfg.token()?)?;
@@ -64,7 +67,7 @@ pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
         cfg.storage.vault_path.clone(),
     );
     let exe = std::env::current_exe()?;
-    let mut idle_since: HashMap<String, Instant> = HashMap::new();
+    let mut state = SupState::default();
 
     tracing::info!(
         "supervisor start scope={} poll={}s pools={:?}",
@@ -77,11 +80,32 @@ pub fn run(cfg: &Config, cfg_path: &Path) -> Result<()> {
     );
 
     loop {
-        if let Err(e) = reconcile(cfg, cfg_path, &client, &sd, &gate, &exe, &mut idle_since) {
+        if let Err(e) = reconcile(cfg, cfg_path, &client, &sd, &gate, &exe, &mut state) {
             tracing::warn!("reconcile error: {e:#}");
         }
         std::thread::sleep(Duration::from_secs(cfg.supervisor.poll_seconds.max(1)));
     }
+}
+
+fn acquire_singleton() -> Result<nix::fcntl::Flock<std::fs::File>> {
+    use nix::fcntl::{Flock, FlockArg};
+    std::fs::create_dir_all(paths::state_dir())?;
+    let path = paths::state_dir().join("supervisor.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock)
+        .map_err(|_| anyhow::anyhow!("another vmfleet supervisor is already running"))
+}
+
+/// Mutable supervisor state carried across reconcile cycles.
+#[derive(Default)]
+pub struct SupState {
+    idle_since: HashMap<String, Instant>,
+    cycle: u64,
+    cached_queued: HashMap<String, u32>,
 }
 
 /// One reconcile pass. Public-in-crate so `status` can render a live view too.
@@ -92,7 +116,7 @@ pub fn reconcile(
     sd: &Systemd,
     gate: &admission::Gate,
     exe: &Path,
-    idle_since: &mut HashMap<String, Instant>,
+    state: &mut SupState,
 ) -> Result<()> {
     let runners = match client.list_runners() {
         Ok(r) => r,
@@ -101,7 +125,18 @@ pub fn reconcile(
             return Ok(());
         }
     };
-    let queued = client.queued_labels();
+    // Recover any worker units left in `failed` state (else systemd-run can't
+    // reuse the slot name). reset_failed is also called just-in-time at launch.
+    for u in sd.list_failed(naming::WORKER_UNIT_GLOB) {
+        sd.reset_failed(&u);
+    }
+    // Throttle the expensive (N+1) queued-jobs scan: only every Nth cycle.
+    let every = cfg.supervisor.queued_poll_every.max(1) as u64;
+    if state.cycle.is_multiple_of(every) {
+        state.cached_queued = client.queued_labels();
+    }
+    state.cycle = state.cycle.wrapping_add(1);
+    let queued = state.cached_queued.clone();
     let active_units = sd.list_active(naming::WORKER_UNIT_GLOB).unwrap_or_default();
     let active_slots: HashSet<u32> = active_units
         .iter()
@@ -125,9 +160,12 @@ pub fn reconcile(
         .filter(|r| r.online() && !r.busy)
         .map(|r| r.name.clone())
         .collect();
-    idle_since.retain(|k, _| now_idle.contains(k));
+    state.idle_since.retain(|k, _| now_idle.contains(k));
     for name in &now_idle {
-        idle_since.entry(name.clone()).or_insert_with(Instant::now);
+        state
+            .idle_since
+            .entry(name.clone())
+            .or_insert_with(Instant::now);
     }
 
     let mut reports = Vec::new();
@@ -189,7 +227,8 @@ pub fn reconcile(
                 .collect();
             // oldest-idle first
             candidates.sort_by_key(|(r, _)| {
-                idle_since
+                state
+                    .idle_since
                     .get(&r.name)
                     .copied()
                     .unwrap_or_else(Instant::now)
@@ -198,7 +237,8 @@ pub fn reconcile(
                 if excess == 0 {
                     break;
                 }
-                let long_idle = idle_since
+                let long_idle = state
+                    .idle_since
                     .get(&r.name)
                     .map(|t| t.elapsed() >= idle_timeout)
                     .unwrap_or(false);
@@ -241,7 +281,45 @@ pub fn reconcile(
         pools: reports,
     };
     write_status(&report);
+    write_metrics(&report);
     Ok(())
+}
+
+/// Write a Prometheus textfile-collector file next to status.json.
+fn write_metrics(report: &Report) {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "vmfleet_mem_available_mib {}\n",
+        report.mem_avail_mib
+    ));
+    s.push_str(&format!("vmfleet_memory_psi_some_avg10 {}\n", report.psi));
+    s.push_str(&format!("vmfleet_disk_free_gib {}\n", report.disk_free_gib));
+    s.push_str(&format!("vmfleet_headroom_vms {}\n", report.headroom_vms));
+    s.push_str(&format!(
+        "vmfleet_blocked {}\n",
+        report.blocked.is_some() as u8
+    ));
+    for p in &report.pools {
+        let l = &p.name;
+        s.push_str(&format!("vmfleet_pool_idle{{pool=\"{l}\"}} {}\n", p.idle));
+        s.push_str(&format!("vmfleet_pool_busy{{pool=\"{l}\"}} {}\n", p.busy));
+        s.push_str(&format!(
+            "vmfleet_pool_queued{{pool=\"{l}\"}} {}\n",
+            p.queued
+        ));
+        s.push_str(&format!(
+            "vmfleet_pool_present{{pool=\"{l}\"}} {}\n",
+            p.present
+        ));
+        s.push_str(&format!(
+            "vmfleet_pool_desired{{pool=\"{l}\"}} {}\n",
+            p.desired
+        ));
+    }
+    let tmp = paths::metrics_file().with_extension("tmp");
+    if std::fs::create_dir_all(paths::state_dir()).is_ok() && std::fs::write(&tmp, &s).is_ok() {
+        let _ = std::fs::rename(&tmp, paths::metrics_file());
+    }
 }
 
 fn launch(sd: &Systemd, exe: &Path, cfg_path: &Path, pool: &Pool, slot: u32) -> Result<()> {
