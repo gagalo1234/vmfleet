@@ -8,11 +8,28 @@ Single TOML file (default `~/.config/vmfleet/vmfleet.toml`). See
 |---|---|---|
 | `repo` | — | `owner/name` for a repo-level fleet (xor `org`) |
 | `org` | — | org login for an org-level fleet (xor `repo`) |
-| `token_file` | — | path to PAT file; env `VMFLEET_TOKEN` overrides at runtime |
+| `token_file` | — | path to the token file; env `VMFLEET_TOKEN` overrides at runtime |
 | `runner_group_id` | `1` | runner group for JIT registration |
 | `api_base` | `https://api.github.com` | override for GitHub Enterprise Server |
 
-PAT scopes: repo → *Administration: Read and write*; org → *Self-hosted runners: RW*.
+### Authentication
+`vmfleet install` and `vmfleet login` obtain the token for you via GitHub's **OAuth
+device flow** (the browser-authorize flow `gh auth login` uses) and write it to
+`token_file` (mode 0600). The requested scope is derived from the fleet type: repo →
+`repo` (*Administration RW*); org → `admin:org` (*Self-hosted runners RW*). Re-auth any
+time with `vmfleet login`; use `vmfleet login --with-token` (or answer "no" at the
+install prompt) to paste a PAT with the same scopes instead.
+
+Device-flow environment overrides:
+
+| env | default | meaning |
+|---|---|---|
+| `VMFLEET_OAUTH_CLIENT_ID` | *(embedded)* | OAuth App client id to authenticate against; overrides the built-in one (required for GHES or a custom app) |
+| `VMFLEET_OAUTH_BASE` | `https://github.com` | device-flow host (`{base}/login/device/code`, `{base}/login/oauth/access_token`); point at your GHES host |
+
+The embedded client id requires an OAuth App (with **Device Flow enabled**) to be
+registered; until one is configured, device flow errors and you can fall back to
+`--with-token`.
 
 ## `[storage]`
 | key | default | meaning |

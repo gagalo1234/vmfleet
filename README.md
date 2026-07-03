@@ -16,7 +16,9 @@ when work arrives, while guaranteeing the host stays within a memory/disk budget
 ## Requirements
 
 - Linux with **systemd** (user services) and **[Multipass](https://multipass.run)**
-- A GitHub PAT with runner admin (repo: *Administration* RW, or org: *self-hosted runners* RW)
+- GitHub runner-admin access. Install authenticates you via **browser device flow**
+  (like `gh auth login`) — no PAT to create by hand. A PAT with runner admin (repo:
+  *Administration* RW, or org: *self-hosted runners* RW) still works as a fallback.
 - `linger` enabled for your user (the installer does this) so services survive logout/reboot
 
 No `gh`, no Python — vmfleet talks to the GitHub REST API directly.
@@ -27,7 +29,8 @@ No `gh`, no Python — vmfleet talks to the GitHub REST API directly.
 # 1. build (or grab a release binary)
 cargo build --release && install -m755 target/release/vmfleet ~/.local/bin/vmfleet
 
-# 2. guided install — prompts for repo/PAT/pools, installs the supervisor
+# 2. guided install — prompts for repo/pools, authenticates via browser device
+#    flow (or paste a PAT), installs the supervisor
 vmfleet install
 
 # 3. build the base VM image (one-time; from your provisioning manifest)
@@ -51,6 +54,7 @@ jobs:
 | Command | What it does |
 |---|---|
 | `vmfleet install` | Guided (or `--non-interactive`) setup: config, linger, supervisor unit |
+| `vmfleet login [--with-token]` | (Re)authenticate to GitHub via browser device flow; `--with-token` pastes a PAT instead |
 | `vmfleet build-base` | Build/rebuild the base VM from the provisioning manifest |
 | `vmfleet status` | Pools, workers, host resources (reads the supervisor's status.json) |
 | `vmfleet doctor` | Preflight: multipass, token+scope, base VM, disk, memory, linger |

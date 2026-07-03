@@ -423,7 +423,7 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         (Some(scope), None)
     };
     let token_file: String = Input::new()
-        .with_prompt("Path to PAT token file")
+        .with_prompt("Path to token file")
         .default(
             paths::config_dir()
                 .join("token")
@@ -432,14 +432,9 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         )
         .interact_text()?;
     if !Path::new(&token_file).exists() {
-        let tok: String = Input::new()
-            .with_prompt("Paste PAT (stored 0600)")
-            .interact_text()?;
-        if let Some(d) = Path::new(&token_file).parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&token_file, tok.trim())?;
-        set_mode_600(&token_file);
+        let scope = crate::oauth::scope_from_repo(repo.is_some());
+        let tok = obtain_token(scope)?;
+        store_token(Path::new(&token_file), &tok)?;
     }
     let vault: String = Input::new()
         .with_prompt("Multipass vault path (disk gate)")
@@ -518,6 +513,74 @@ fn set_mode_600(path: &str) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+}
+
+/// Obtain a GitHub token interactively: browser device flow by default (like
+/// `gh auth login`), with manual PAT paste as a fallback for no-browser / CI /
+/// GHES setups. `scope` is the OAuth scope the device flow requests.
+fn obtain_token(scope: &str) -> Result<String> {
+    use dialoguer::{Confirm, Input};
+    let use_browser = Confirm::new()
+        .with_prompt("Authenticate via browser (GitHub device flow)?")
+        .default(true)
+        .interact()?;
+    if use_browser {
+        crate::oauth::login(scope, crate::oauth::DEFAULT_POLL_INTERVAL)
+    } else {
+        let tok: String = Input::new()
+            .with_prompt("Paste PAT (stored 0600)")
+            .interact_text()?;
+        Ok(tok.trim().to_string())
+    }
+}
+
+/// Persist a token to `path` (creating its parent dir) with 0600 permissions.
+fn store_token(path: &Path, token: &str) -> Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(path, token.trim())?;
+    set_mode_600(&path.to_string_lossy());
+    Ok(())
+}
+
+// ===================== login =====================
+pub struct LoginOpts {
+    /// Skip the browser device flow and paste a PAT instead.
+    pub with_token: bool,
+}
+
+/// Re-authenticate an existing fleet: obtain a token (device flow or PAT), store it
+/// at the config's `token_file`, and validate it against the GitHub API.
+pub fn login(cfg_path: &Path, opts: &LoginOpts) -> Result<()> {
+    if !cfg_path.exists() {
+        bail!(
+            "no config at {} — run `vmfleet install` first",
+            cfg_path.display()
+        );
+    }
+    let cfg = Config::load(cfg_path)?;
+    let token = if opts.with_token {
+        use dialoguer::Input;
+        let tok: String = Input::new()
+            .with_prompt("Paste PAT (stored 0600)")
+            .interact_text()?;
+        tok.trim().to_string()
+    } else {
+        crate::oauth::login(
+            crate::oauth::scope_for(&cfg.github),
+            crate::oauth::DEFAULT_POLL_INTERVAL,
+        )?
+    };
+    // Validate before persisting so a bad token never clobbers a working one.
+    github::check_token(&cfg.github, &token).context("validating the new token")?;
+    store_token(&cfg.github.token_file, &token)?;
+    println!(
+        "logged in — token stored at {} (scope {})",
+        cfg.github.token_file.display(),
+        cfg.github.scope_path()?
+    );
+    Ok(())
 }
 
 // ===================== uninstall =====================

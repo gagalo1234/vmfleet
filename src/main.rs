@@ -8,6 +8,7 @@ mod config;
 mod github;
 mod multipass;
 mod naming;
+mod oauth;
 mod paths;
 mod resources;
 mod selfupdate;
@@ -44,6 +45,8 @@ enum Cmd {
     Install(InstallArgs),
     /// Complete teardown of this fleet (VMs, runners, units; optionally config/base).
     Uninstall(UninstallArgs),
+    /// Authenticate to GitHub via browser device flow (or `--with-token`) and store the token.
+    Login(LoginArgs),
     /// Run the autoscaling control-plane loop (systemd ExecStart).
     #[command(hide = true)]
     Supervisor {
@@ -104,6 +107,13 @@ struct SelfUpdateArgs {
     /// Swap the binary but do not migrate config / rewrite units / restart supervisor.
     #[arg(long)]
     no_restart: bool,
+}
+
+#[derive(clap::Args)]
+struct LoginArgs {
+    /// Paste a PAT instead of using the browser device flow (no-browser / CI / GHES).
+    #[arg(long)]
+    with_token: bool,
 }
 
 #[derive(clap::Args)]
@@ -179,6 +189,12 @@ fn run() -> Result<()> {
             &commands::UninstallOpts {
                 purge_all: a.purge_all,
                 yes: a.yes,
+            },
+        ),
+        Cmd::Login(a) => commands::login(
+            &cfg_path,
+            &commands::LoginOpts {
+                with_token: a.with_token,
             },
         ),
         Cmd::Supervisor { once, dry_run } => {

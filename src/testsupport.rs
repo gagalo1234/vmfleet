@@ -6,7 +6,8 @@ use crate::cmd::{CmdOut, Runner};
 use anyhow::Result;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -111,6 +112,85 @@ impl FixtureGitHub {
             }
         });
         FixtureGitHub {
+            base_url: format!("http://{addr}"),
+        }
+    }
+}
+
+/// A throwaway localhost server standing in for GitHub's OAuth **device-flow**
+/// endpoints (which live on github.com, not the REST `api_base`). Point the `oauth`
+/// module at `base_url` via `VMFLEET_OAUTH_BASE`, or pass it straight to
+/// `run_device_flow`. Serves `/login/device/code` (a code with `interval: 0` so the
+/// poll loop runs without sleeping) and `/login/oauth/access_token`.
+pub struct FixtureOAuth {
+    pub base_url: String,
+}
+
+/// What the token endpoint should return.
+enum OAuthBehavior {
+    /// `authorization_pending` for the first `pending` polls, then `access_token`.
+    Token { token: String, pending: usize },
+    /// Always return this OAuth error code.
+    Error(String),
+}
+
+impl FixtureOAuth {
+    /// Return `token` after `pending` `authorization_pending` responses.
+    pub fn start(token: impl Into<String>, pending: usize) -> FixtureOAuth {
+        Self::spawn(OAuthBehavior::Token {
+            token: token.into(),
+            pending,
+        })
+    }
+
+    /// Always fail the token endpoint with the given OAuth error code.
+    pub fn start_error(error: impl Into<String>) -> FixtureOAuth {
+        Self::spawn(OAuthBehavior::Error(error.into()))
+    }
+
+    fn spawn(behavior: OAuthBehavior) -> FixtureOAuth {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture oauth server");
+        let addr = listener.local_addr().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path.contains("device/code") {
+                    r#"{"device_code":"DC-123","user_code":"WXYZ-1234","verification_uri":"https://github.test/login/device","interval":0}"#.to_string()
+                } else if path.contains("oauth/access_token") {
+                    match &behavior {
+                        OAuthBehavior::Error(e) => format!(r#"{{"error":"{e}"}}"#),
+                        OAuthBehavior::Token { token, pending } => {
+                            let seen = polls.fetch_add(1, Ordering::SeqCst);
+                            if seen < *pending {
+                                r#"{"error":"authorization_pending"}"#.to_string()
+                            } else {
+                                format!(r#"{{"access_token":"{token}"}}"#)
+                            }
+                        }
+                    }
+                } else {
+                    "{}".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        FixtureOAuth {
             base_url: format!("http://{addr}"),
         }
     }
