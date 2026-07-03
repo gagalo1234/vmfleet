@@ -14,6 +14,11 @@ mod supervisor;
 mod systemd;
 mod worker;
 
+#[cfg(test)]
+mod e2e_offline;
+#[cfg(test)]
+mod testsupport;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -39,7 +44,16 @@ enum Cmd {
     /// Complete teardown of this fleet (VMs, runners, units; optionally config/base).
     Uninstall(UninstallArgs),
     /// Run the autoscaling control-plane loop (systemd ExecStart).
-    Supervisor,
+    Supervisor {
+        /// Run a single reconcile pass and exit instead of looping forever.
+        #[arg(long)]
+        once: bool,
+        /// Compute the reconcile decision and print it as JSON, without launching
+        /// or stopping anything (and without touching the live status file). Safe to
+        /// run alongside a live supervisor — previews "what would it do right now".
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run a single ephemeral VM worker for a pool+slot (spawned by the supervisor).
     Worker { pool: String, slot: u32 },
     /// Show fleet status (pools, workers, host resources).
@@ -140,9 +154,9 @@ fn run() -> Result<()> {
                 yes: a.yes,
             },
         ),
-        Cmd::Supervisor => {
+        Cmd::Supervisor { once, dry_run } => {
             let cfg = config::Config::load(&cfg_path)?;
-            supervisor::run(&cfg, &cfg_path)
+            supervisor::run(&cfg, &cfg_path, *once, *dry_run)
         }
         Cmd::Worker { pool, slot } => {
             let cfg = config::Config::load(&cfg_path)?;

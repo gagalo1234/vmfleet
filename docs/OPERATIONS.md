@@ -64,6 +64,54 @@ vmfleet install --upgrade      # reinstall unit / migrate config
 systemctl --user restart vmfleet-supervisor
 ```
 
+## Dev dogfooding loop
+
+Running the dev build yourself and fixing issues in place is a first-class workflow.
+The recipes live in the [`justfile`](../justfile) (or the [`Makefile`](../Makefile) if
+you don't have `just`).
+
+**First-time local install** — build, install the binary, guided config, base image,
+health check. After this the supervisor runs on your host and you are running the dev
+build:
+
+```bash
+just dev-install          # == README Quickstart; or `make dev-install`
+```
+
+**Fast iterate** — after a change, self-check then hot-swap:
+
+```bash
+just plan                 # preview one reconcile cycle as JSON — no side effects
+just update-safe          # fmt+clippy+tests + dry-run first; abort on failure, else hot-swap
+just update               # hot-swap without the self-check
+```
+
+The hot-swap (`systemctl --user restart vmfleet-supervisor`) is **safe with jobs in
+flight**: workers are independent transient units with no `Restart=`, so restarting
+the supervisor never interrupts a running job — the new binary just takes over
+scheduling on the next cycle. A second supervisor can't start by accident either: it
+holds an exclusive `supervisor.lock` singleton (a `--dry-run` preview deliberately
+skips the lock so it can run alongside the live one).
+
+**Which command for which change** (one binary is both supervisor and worker):
+
+| Changed | Command | How it takes effect |
+|---|---|---|
+| supervisor / scaling logic | `just update` | next reconcile cycle |
+| worker logic (`src/worker.rs`) | `just update` | newly launched workers use it; in-flight ones finish on the old binary |
+| base image / provisioning (`provision/`) | `just update` + `vmfleet build-base --force` | new VMs use the new image; running VMs are unchanged |
+| config (pools/labels/thresholds) | `vmfleet scale …`, or edit the TOML + restart | no rebuild needed |
+
+**Isolating a staging fleet.** Everything vmfleet creates is namespaced under a single
+fixed `vmfleet-` prefix (fixed unit names, one config/state path), so **two fleets under
+the same Linux user collide** (same supervisor/worker unit names, `gc` could sweep each
+other's VMs). To run a dev/staging fleet next to a production one: use a **separate host**,
+or a **separate Linux user** (its own systemd user instance, `linger`, and XDG dirs), and
+point it at a **different repo/org** or at least **distinct pool labels** so GitHub routes
+jobs to the right fleet.
+
+See [TESTING.md](TESTING.md) for the full test strategy.
+
 ## Uninstall
 
 ```bash

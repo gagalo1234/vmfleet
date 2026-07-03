@@ -1,0 +1,38 @@
+name: live-smoke
+
+# Manual, self-hosted live smoke test. Unlike `ci` (which is fully hermetic and runs
+# on free GitHub-hosted runners), this exercises the real host surface: Multipass,
+# systemd --user and the GitHub runner API.
+#
+# It MUST run on your own machine registered as a self-hosted runner with Multipass
+# installed and `linger` enabled — GitHub-hosted runners cannot launch VMs (no
+# reliable nested KVM). Set the `live` label on that runner, or edit `runs-on`.
+#
+# By default it only previews decisions (`supervisor --once --dry-run`) and runs
+# `doctor`; it does not build the base image or launch VMs unless you opt in.
+on:
+  workflow_dispatch:
+    inputs:
+      build_base:
+        description: "Also rebuild the base VM image (slow; real Multipass work)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, live]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: cargo build --release
+      - name: doctor (preflight against the real host)
+        run: ./target/release/vmfleet doctor
+      - name: preview one reconcile cycle (no side effects)
+        run: ./target/release/vmfleet supervisor --once --dry-run
+      - name: rebuild base image (opt-in)
+        if: ${{ inputs.build_base }}
+        run: ./target/release/vmfleet build-base --force

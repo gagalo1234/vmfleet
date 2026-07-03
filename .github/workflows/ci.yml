@@ -28,6 +28,10 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # Unit tests + the hermetic offline e2e (reconcile against a localhost GitHub
+      # fixture with systemd mocked) + the CLI smoke tests all run here — no
+      # Multipass, systemd or network required, so it stays free on hosted runners.
+      # Real-VM validation is the manual, self-hosted `live-smoke` workflow.
       - name: test
         run: cargo test --all
       - name: build release
