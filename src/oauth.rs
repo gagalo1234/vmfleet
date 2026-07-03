@@ -14,12 +14,14 @@ use serde::Deserialize;
 use std::time::Duration;
 
 /// OAuth App Client ID. Device flow uses a **public** client (no secret), so the
-/// id is safe to embed in the binary. Register an OAuth App under the `gagalo1234`
-/// account with **Device Flow enabled**, then replace this placeholder — or set
-/// `VMFLEET_OAUTH_CLIENT_ID` at runtime to override.
-const DEFAULT_OAUTH_CLIENT_ID: &str = "REPLACE_WITH_gagalo1234_OAUTH_APP_CLIENT_ID";
+/// id is safe to embed in the binary. This is the "vmfleet" OAuth App registered
+/// under the `gagalo1234` account (Device Flow enabled). Override at runtime with
+/// `VMFLEET_OAUTH_CLIENT_ID` (e.g. for GHES or a fork's own app).
+const DEFAULT_OAUTH_CLIENT_ID: &str = "Ov23lirEtdrlQmy5kd9Z";
 
-/// Marker prefix identifying the not-yet-configured placeholder above.
+/// Marker prefix for a not-yet-configured placeholder client id (used by forks that
+/// haven't registered their own app). If `DEFAULT_OAUTH_CLIENT_ID` still starts with
+/// this, device flow errors with a helpful message instead of calling GitHub.
 const PLACEHOLDER_PREFIX: &str = "REPLACE_WITH_";
 
 const USER_AGENT: &str = "vmfleet";
@@ -54,17 +56,24 @@ pub fn scope_for(gh: &GitHub) -> &'static str {
 /// (takes the env value as an argument) so it is testable without touching the
 /// process environment.
 fn resolve_client_id(from_env: Option<&str>) -> Result<String> {
+    resolve_client_id_with(from_env, DEFAULT_OAUTH_CLIENT_ID)
+}
+
+/// Core resolution logic, with the embedded default passed in so both the fallback
+/// and the placeholder-error paths stay unit-testable regardless of what the
+/// shipped `DEFAULT_OAUTH_CLIENT_ID` currently is.
+fn resolve_client_id_with(from_env: Option<&str>, default_id: &str) -> Result<String> {
     if let Some(id) = from_env.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(id.to_string());
     }
-    if DEFAULT_OAUTH_CLIENT_ID.starts_with(PLACEHOLDER_PREFIX) {
+    if default_id.starts_with(PLACEHOLDER_PREFIX) {
         bail!(
             "no GitHub OAuth App client id configured. Register an OAuth App (with Device \
              Flow enabled) and set its client id, or export VMFLEET_OAUTH_CLIENT_ID. To skip \
              device flow entirely, authenticate with a PAT: `vmfleet login --with-token`."
         );
     }
-    Ok(DEFAULT_OAUTH_CLIENT_ID.to_string())
+    Ok(default_id.to_string())
 }
 
 /// Resolve the device-flow base URL. `VMFLEET_OAUTH_BASE` overrides (tests point it
@@ -200,12 +209,25 @@ mod tests {
     }
 
     #[test]
-    fn client_id_prefers_env_then_errors_on_placeholder() {
+    fn client_id_prefers_env_over_default() {
+        // a non-empty env value always wins and is trimmed
         assert_eq!(resolve_client_id(Some("gh_abc")).unwrap(), "gh_abc");
         assert_eq!(resolve_client_id(Some("  gh_abc  ")).unwrap(), "gh_abc");
-        // the embedded default is still the placeholder, so no env => error
-        assert!(resolve_client_id(None).is_err());
-        assert!(resolve_client_id(Some("   ")).is_err());
+        // the shipped default is a real id, so no env => fall back to it
+        assert_eq!(resolve_client_id(None).unwrap(), DEFAULT_OAUTH_CLIENT_ID);
+    }
+
+    #[test]
+    fn client_id_errors_when_default_is_placeholder() {
+        let placeholder = "REPLACE_WITH_something";
+        // no env + placeholder default => helpful error
+        assert!(resolve_client_id_with(None, placeholder).is_err());
+        assert!(resolve_client_id_with(Some("   "), placeholder).is_err());
+        // env override rescues even a placeholder default
+        assert_eq!(
+            resolve_client_id_with(Some("gh_abc"), placeholder).unwrap(),
+            "gh_abc"
+        );
     }
 
     #[test]
