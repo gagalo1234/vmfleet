@@ -10,6 +10,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Names that end up in Multipass VM names, systemd unit names and Prometheus
+/// labels must be lowercase alphanumeric + hyphen (no spaces/uppercase/specials).
+fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Current config schema version.
 pub const CURRENT_VERSION: u32 = 1;
 fn d_version() -> u32 {
@@ -342,6 +350,12 @@ impl Config {
         }
         let mut base_names = std::collections::HashSet::new();
         for b in &self.bases {
+            if !valid_name(&b.name) {
+                bail!(
+                    "base name `{}` must be lowercase alphanumeric characters and hyphens",
+                    b.name
+                );
+            }
             if !base_names.insert(b.name.clone()) {
                 bail!("duplicate base name `{}`", b.name);
             }
@@ -366,6 +380,12 @@ impl Config {
             }
             if p.labels.is_empty() {
                 bail!("pool `{}`: at least one label required", p.name);
+            }
+            if !valid_name(&p.name) {
+                bail!(
+                    "pool name `{}` must be lowercase alphanumeric characters and hyphens",
+                    p.name
+                );
             }
             if !seen_names.insert(p.name.clone()) {
                 bail!("duplicate pool name `{}`", p.name);
@@ -494,6 +514,16 @@ slot_base = 201
         let mut cfg: Config = toml::from_str(sample()).unwrap();
         cfg.pools[0].base = Some("nope".into());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bad_names() {
+        let mut cfg: Config = toml::from_str(sample()).unwrap();
+        cfg.pools[0].name = "Big Pool".into(); // space + uppercase
+        assert!(cfg.validate().is_err());
+        let mut cfg2: Config = toml::from_str(sample()).unwrap();
+        cfg2.bases[0].name = "Base_1".into();
+        assert!(cfg2.validate().is_err());
     }
 
     #[test]

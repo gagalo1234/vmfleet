@@ -103,7 +103,13 @@ impl Client {
                 Ok(resp) => return Ok(resp),
                 // primary/secondary rate limit: honor Retry-After / X-RateLimit-Reset
                 Err(ureq::Error::Status(code, resp)) if code == 403 || code == 429 => {
-                    let wait = rate_limit_wait(&resp).unwrap_or(2 * attempt as u64).min(60);
+                    // Filter out 0 (clock skew where local time is ahead of the
+                    // reset epoch) so we fall back to exponential backoff rather
+                    // than a tight retry loop.
+                    let wait = rate_limit_wait(&resp)
+                        .filter(|&w| w > 0)
+                        .unwrap_or(2 * attempt as u64)
+                        .min(60);
                     tracing::warn!("github {code} (rate limit) on {url}; waiting {wait}s");
                     last = anyhow!("{method} {url}: {code} rate-limited");
                     std::thread::sleep(Duration::from_secs(wait));
@@ -153,7 +159,10 @@ impl Client {
             let page: RunnersResp = resp.into_json()?;
             out.extend(page.runners);
             match next {
-                Some(n) => url = n,
+                // Only follow pagination within our own API host — never attach
+                // the auth token to a URL a manipulated Link header points to.
+                Some(n) if n.starts_with(&self.api_base) => url = n,
+                Some(n) => bail!("refusing to follow pagination link to foreign host: {n}"),
                 None => break,
             }
         }

@@ -260,12 +260,19 @@ pub fn install(cfg_path: &Path, opts: &InstallOpts) -> Result<()> {
     let cfg = if cfg_path.exists() {
         let mut cfg = Config::load(cfg_path)?;
         if opts.upgrade {
-            if crate::config::migrate(&mut cfg) && !opts.dry_run {
-                write_config(&cfg, cfg_path)?;
-                println!(
-                    "migrated config to version {}",
-                    crate::config::CURRENT_VERSION
-                );
+            if crate::config::migrate(&mut cfg) {
+                if opts.dry_run {
+                    println!(
+                        "dry-run: would migrate config to version {}",
+                        crate::config::CURRENT_VERSION
+                    );
+                } else {
+                    write_config(&cfg, cfg_path)?;
+                    println!(
+                        "migrated config to version {}",
+                        crate::config::CURRENT_VERSION
+                    );
+                }
             } else {
                 println!("config already at version {}", cfg.version);
             }
@@ -344,13 +351,20 @@ pub fn install(cfg_path: &Path, opts: &InstallOpts) -> Result<()> {
     Ok(())
 }
 
+/// Absolute path for embedding in a systemd unit (user services run from $HOME,
+/// so relative config paths would not resolve). Does not require the file to exist.
+fn abs(p: &Path) -> std::path::PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 fn install_gc_timer(exe: &Path, cfg_path: &Path) -> Result<()> {
     let dir = paths::systemd_user_dir();
     std::fs::create_dir_all(&dir)?;
+    // Quote paths so spaces don't split into extra ExecStart arguments.
     let svc = format!(
-        "[Unit]\nDescription=vmfleet orphan GC\n\n[Service]\nType=oneshot\nExecStart={} --config {} gc\n",
+        "[Unit]\nDescription=vmfleet orphan GC\n\n[Service]\nType=oneshot\nExecStart=\"{}\" --config \"{}\" gc\n",
         exe.display(),
-        cfg_path.display()
+        abs(cfg_path).display()
     );
     let timer = "[Unit]\nDescription=vmfleet orphan GC timer\n\n[Timer]\nOnCalendar=hourly\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n";
     std::fs::write(dir.join(naming::GC_SERVICE), svc)?;
@@ -365,14 +379,14 @@ fn supervisor_unit_contents(exe: &Path, cfg_path: &Path) -> String {
          After=default.target\n\n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={} --config {} supervisor\n\
+         ExecStart=\"{}\" --config \"{}\" supervisor\n\
          Restart=always\n\
          RestartSec=10\n\
          KillMode=process\n\n\
          [Install]\n\
          WantedBy=default.target\n",
         exe.display(),
-        cfg_path.display()
+        abs(cfg_path).display()
     )
 }
 
