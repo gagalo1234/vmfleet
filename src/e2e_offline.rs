@@ -47,8 +47,15 @@ image = "24.04"
     );
     let mut cfg: Config = toml::from_str(&toml).unwrap();
     cfg.github.api_base = fx.base_url.clone();
-    cfg.storage.vault_path = dir; // exists, so the disk-free check has a real path
-                                  // Neutralise the resource gate by default: never blocked, headroom unbounded.
+    // Give each test its own vault dir. reconcile only *reads* disk-free from it
+    // (it never acquires the admission lock — that's the worker launch path), but
+    // isolating keeps the tests independent and future-proof.
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let vault = dir.join(format!("vault-{id}"));
+    std::fs::create_dir_all(&vault).unwrap();
+    cfg.storage.vault_path = vault;
+    // Neutralise the resource gate by default: never blocked, headroom unbounded.
     cfg.admission.min_avail_mib = 0;
     cfg.admission.psi_max = f64::MAX;
     cfg.admission.min_disk_gib = 0;

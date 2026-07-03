@@ -96,7 +96,14 @@ pub fn run(cfg: &Config, cfg_path: &Path, once: bool, dry_run: bool) -> Result<(
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!("reconcile error: {e:#}"),
+            Err(e) => {
+                // A one-off run must surface failures as a non-zero exit (scripts,
+                // live-smoke). The daemon loop instead logs and rides out the blip.
+                if once {
+                    return Err(e);
+                }
+                tracing::warn!("reconcile error: {e:#}");
+            }
         }
         if once {
             return Ok(());
@@ -140,21 +147,10 @@ pub fn reconcile(
     state: &mut SupState,
     dry_run: bool,
 ) -> Result<Report> {
-    let runners = match client.list_runners() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("github list_runners failed (transient), skipping cycle: {e}");
-            return Ok(Report {
-                ts: 0,
-                mem_avail_mib: 0,
-                psi: 0.0,
-                disk_free_gib: 0,
-                blocked: None,
-                headroom_vms: 0,
-                pools: Vec::new(),
-            });
-        }
-    };
+    // A GitHub API failure aborts the whole cycle. The daemon loop logs it and
+    // retries on the next poll; `--once`/dry-run surface it as a non-zero exit
+    // rather than a misleading empty report.
+    let runners = client.list_runners()?;
     // Recover any worker units left in `failed` state (else systemd-run can't
     // reuse the slot name). reset_failed is also called just-in-time at launch.
     if !dry_run {

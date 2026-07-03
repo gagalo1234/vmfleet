@@ -86,8 +86,10 @@ impl FixtureGitHub {
                 let Ok(mut stream) = stream else { continue };
                 // GET requests are small; a single read captures the request line.
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let req = String::from_utf8_lossy(&buf);
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]);
                 let path = req
                     .lines()
                     .next()
