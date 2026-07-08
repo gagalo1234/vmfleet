@@ -135,6 +135,21 @@ jobs to the right fleet.
 
 See [TESTING.md](TESTING.md) for the full test strategy.
 
+## Authentication / re-auth
+
+`vmfleet install` authenticates via GitHub's OAuth **device flow** (browser-authorize,
+like `gh auth login`) and stores the token at `[github] token_file`. To rotate or
+refresh credentials without reinstalling:
+
+```bash
+vmfleet login                 # browser device flow (re-auth); re-scopes from repo/org
+vmfleet login --with-token    # paste a PAT instead (no-browser / CI / GHES)
+```
+
+`login` reads the fleet's config for scope + token path, writes the new token 0600, and
+validates it against the API before returning. For GHES or a custom OAuth App, set
+`VMFLEET_OAUTH_CLIENT_ID` / `VMFLEET_OAUTH_BASE` (see [CONFIG.md](CONFIG.md#authentication)).
+
 ## Uninstall
 
 ```bash

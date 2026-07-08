@@ -412,35 +412,97 @@ fn supervisor_unit_contents(exe: &Path, cfg_path: &Path) -> String {
 }
 
 fn prompt_config(cfg_path: &Path) -> Result<Config> {
-    use dialoguer::{Confirm, Input};
+    use dialoguer::{Confirm, Input, Select};
     println!("== vmfleet guided install ==");
-    let scope: String = Input::new()
-        .with_prompt("GitHub repo (owner/name) or org (@org)")
-        .interact_text()?;
-    let (repo, org) = if let Some(o) = scope.strip_prefix('@') {
-        (None, Some(o.to_string()))
-    } else {
-        (Some(scope), None)
-    };
-    let token_file: String = Input::new()
-        .with_prompt("Path to PAT token file")
-        .default(
-            paths::config_dir()
-                .join("token")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .interact_text()?;
-    if !Path::new(&token_file).exists() {
-        let tok: String = Input::new()
-            .with_prompt("Paste PAT (stored 0600)")
-            .interact_text()?;
-        if let Some(d) = Path::new(&token_file).parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&token_file, tok.trim())?;
-        set_mode_600(&token_file);
+
+    // The token always lives at the standard path; advanced users can point the
+    // config elsewhere by editing the TOML afterwards.
+    let token_file = paths::config_dir().join("token");
+    let have_token = token_file.exists();
+
+    // 1. Authentication method, asked up front (like `gh auth login`). The actual
+    //    device-flow / paste happens after we know the scope, below. The browser
+    //    option is only offered when an OAuth App client id is configured, so a fork
+    //    without one falls back to PAT paste instead of crashing mid-install.
+    #[derive(Clone, Copy)]
+    enum Auth {
+        Browser,
+        Pat,
+        Reuse,
     }
+    let browser_ok = crate::oauth::client_id().is_ok();
+    if !browser_ok {
+        println!(
+            "note: browser device flow unavailable (no OAuth App client id configured); \
+             paste a Personal Access Token instead."
+        );
+    }
+    let mut choices: Vec<(&str, Auth)> = Vec::new();
+    if browser_ok {
+        choices.push(("Log in with a browser (GitHub device flow)", Auth::Browser));
+    }
+    choices.push(("Paste a Personal Access Token", Auth::Pat));
+    if have_token {
+        choices.push(("Reuse the existing token file", Auth::Reuse));
+    }
+    let labels: Vec<&str> = choices.iter().map(|(l, _)| *l).collect();
+    let auth = choices[Select::new()
+        .with_prompt("Authenticate to GitHub")
+        .items(&labels)
+        .default(0)
+        .interact()?]
+    .1;
+
+    // 2. Fleet scope: repository vs organization (explicit choice), then the name
+    //    (format-validated), then a confirmation before continuing. This also fixes
+    //    the least-privilege device-flow scope (repo -> `repo`, org -> `admin:org`).
+    let (repo, org) = loop {
+        let is_repo = Select::new()
+            .with_prompt("Fleet scope")
+            .items(&["A single repository", "A whole organization"])
+            .default(0)
+            .interact()?
+            == 0;
+        let (repo, org, summary) = if is_repo {
+            let name: String = Input::new()
+                .with_prompt("Repository (owner/name)")
+                .validate_with(|s: &String| validate_repo(s))
+                .interact_text()?;
+            let name = name.trim().to_string();
+            let summary = format!("repository {name}");
+            (Some(name), None, summary)
+        } else {
+            let name: String = Input::new()
+                .with_prompt("Organization (login)")
+                .validate_with(|s: &String| validate_org(s))
+                .interact_text()?;
+            let name = name.trim().to_string();
+            let summary = format!("organization {name}");
+            (None, Some(name), summary)
+        };
+        let auth_scope = crate::oauth::scope_from_repo(repo.is_some());
+        if Confirm::new()
+            .with_prompt(format!(
+                "Continue with {summary}? (auth scope: {auth_scope})"
+            ))
+            .default(true)
+            .interact()?
+        {
+            break (repo, org);
+        }
+    };
+
+    // 3. Obtain + store the token per the chosen method.
+    match auth {
+        Auth::Browser => {
+            let scope = crate::oauth::scope_from_repo(repo.is_some());
+            let tok = crate::oauth::login(scope, crate::oauth::DEFAULT_POLL_INTERVAL)?;
+            store_token(&token_file, &tok)?;
+        }
+        Auth::Pat => store_token(&token_file, &prompt_pat()?)?,
+        Auth::Reuse => println!("reusing existing token at {}", token_file.display()),
+    }
+
     let vault: String = Input::new()
         .with_prompt("Multipass vault path (disk gate)")
         .default("/var/snap/multipass/common".into())
@@ -473,7 +535,7 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         github: GitHub {
             repo,
             org,
-            token_file: token_file.into(),
+            token_file,
             runner_group_id: 1,
             api_base: "https://api.github.com".into(),
         },
@@ -512,12 +574,98 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-fn set_mode_600(path: &str) {
+/// Prompt for a Personal Access Token and return it trimmed.
+fn prompt_pat() -> Result<String> {
+    use dialoguer::Input;
+    let tok: String = Input::new()
+        .with_prompt("Paste PAT (stored 0600)")
+        .interact_text()?;
+    Ok(tok.trim().to_string())
+}
+
+/// Validate a repo-scope entry is `owner/name` (both parts non-empty, one slash).
+fn validate_repo(s: &str) -> std::result::Result<(), String> {
+    let parts: Vec<&str> = s.trim().split('/').collect();
+    if parts.len() == 2 && parts.iter().all(|p| !p.is_empty()) {
+        Ok(())
+    } else {
+        Err("expected owner/name, e.g. gagalo1234/vmfleet".into())
+    }
+}
+
+/// Validate an org-scope entry is a bare login (non-empty, no slash).
+fn validate_org(s: &str) -> std::result::Result<(), String> {
+    let s = s.trim();
+    if !s.is_empty() && !s.contains('/') {
+        Ok(())
+    } else {
+        Err("expected an organization login, e.g. my-org (no slash)".into())
+    }
+}
+
+/// Persist a token to `path` (creating its parent dir). On Unix the file is created
+/// with mode 0600 up front — never world-readable, even briefly — so the token is
+/// not exposed in the window between write and chmod.
+fn store_token(path: &Path, token: &str) -> Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating token file {}", path.display()))?;
+        // `mode` only applies on creation; re-tighten so a pre-existing, loosely
+        // permissioned file is 0600 before the secret is written into it.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(token.trim().as_bytes())?;
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token.trim())?;
+    }
+    Ok(())
+}
+
+// ===================== login =====================
+pub struct LoginOpts {
+    /// Skip the browser device flow and paste a PAT instead.
+    pub with_token: bool,
+}
+
+/// Re-authenticate an existing fleet: obtain a token (device flow or PAT), store it
+/// at the config's `token_file`, and validate it against the GitHub API.
+pub fn login(cfg_path: &Path, opts: &LoginOpts) -> Result<()> {
+    if !cfg_path.exists() {
+        bail!(
+            "no config at {} — run `vmfleet install` first",
+            cfg_path.display()
+        );
+    }
+    let cfg = Config::load(cfg_path)?;
+    let token = if opts.with_token {
+        prompt_pat()?
+    } else {
+        crate::oauth::login(
+            crate::oauth::scope_for(&cfg.github),
+            crate::oauth::DEFAULT_POLL_INTERVAL,
+        )?
+    };
+    // Validate before persisting so a bad token never clobbers a working one.
+    github::check_token(&cfg.github, &token).context("validating the new token")?;
+    store_token(&cfg.github.token_file, &token)?;
+    println!(
+        "logged in — token stored at {} (scope {})",
+        cfg.github.token_file.display(),
+        cfg.github.scope_path()?
+    );
+    Ok(())
 }
 
 // ===================== uninstall =====================
@@ -677,4 +825,46 @@ fn build_one_base(mp: &Multipass, base: &Base, base_dir: &Path, force: bool) -> 
     }
     println!("base image `{}` ready", base.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_org, validate_repo};
+
+    #[test]
+    fn repo_entry_must_be_owner_slash_name() {
+        assert!(validate_repo("gagalo1234/vmfleet").is_ok());
+        assert!(validate_repo("  gagalo1234/vmfleet  ").is_ok());
+        assert!(validate_repo("vmfleet").is_err()); // no slash
+        assert!(validate_repo("a/b/c").is_err()); // too many parts
+        assert!(validate_repo("/vmfleet").is_err()); // empty owner
+        assert!(validate_repo("gagalo1234/").is_err()); // empty name
+    }
+
+    #[test]
+    fn org_entry_must_be_bare_login() {
+        assert!(validate_org("my-org").is_ok());
+        assert!(validate_org("  my-org  ").is_ok());
+        assert!(validate_org("").is_err());
+        assert!(validate_org("owner/name").is_err()); // slash => looks like a repo
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn store_token_writes_trimmed_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vmfleet-store-token-{}", std::process::id()));
+        let path = dir.join("token");
+        // seed a world-readable file to prove the overwrite path also tightens perms
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::store_token(&path, "  gho_secret\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gho_secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
