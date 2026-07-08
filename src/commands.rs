@@ -421,19 +421,37 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
     let have_token = token_file.exists();
 
     // 1. Authentication method, asked up front (like `gh auth login`). The actual
-    //    device-flow / paste happens after we know the scope, below.
-    let mut methods = vec![
-        "Log in with a browser (GitHub device flow)",
-        "Paste a Personal Access Token",
-    ];
-    if have_token {
-        methods.push("Reuse the existing token file");
+    //    device-flow / paste happens after we know the scope, below. The browser
+    //    option is only offered when an OAuth App client id is configured, so a fork
+    //    without one falls back to PAT paste instead of crashing mid-install.
+    #[derive(Clone, Copy)]
+    enum Auth {
+        Browser,
+        Pat,
+        Reuse,
     }
-    let method = Select::new()
+    let browser_ok = crate::oauth::client_id().is_ok();
+    if !browser_ok {
+        println!(
+            "note: browser device flow unavailable (no OAuth App client id configured); \
+             paste a Personal Access Token instead."
+        );
+    }
+    let mut choices: Vec<(&str, Auth)> = Vec::new();
+    if browser_ok {
+        choices.push(("Log in with a browser (GitHub device flow)", Auth::Browser));
+    }
+    choices.push(("Paste a Personal Access Token", Auth::Pat));
+    if have_token {
+        choices.push(("Reuse the existing token file", Auth::Reuse));
+    }
+    let labels: Vec<&str> = choices.iter().map(|(l, _)| *l).collect();
+    let auth = choices[Select::new()
         .with_prompt("Authenticate to GitHub")
-        .items(&methods)
+        .items(&labels)
         .default(0)
-        .interact()?;
+        .interact()?]
+    .1;
 
     // 2. Fleet scope: repository vs organization (explicit choice), then the name
     //    (format-validated), then a confirmation before continuing. This also fixes
@@ -474,15 +492,15 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
         }
     };
 
-    // 3. Obtain + store the token per the chosen method (index 2 = reuse existing).
-    match method {
-        0 => {
+    // 3. Obtain + store the token per the chosen method.
+    match auth {
+        Auth::Browser => {
             let scope = crate::oauth::scope_from_repo(repo.is_some());
             let tok = crate::oauth::login(scope, crate::oauth::DEFAULT_POLL_INTERVAL)?;
             store_token(&token_file, &tok)?;
         }
-        1 => store_token(&token_file, &prompt_pat()?)?,
-        _ => println!("reusing existing token at {}", token_file.display()),
+        Auth::Pat => store_token(&token_file, &prompt_pat()?)?,
+        Auth::Reuse => println!("reusing existing token at {}", token_file.display()),
     }
 
     let vault: String = Input::new()
@@ -556,14 +574,6 @@ fn prompt_config(cfg_path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-fn set_mode_600(path: &str) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-}
-
 /// Prompt for a Personal Access Token and return it trimmed.
 fn prompt_pat() -> Result<String> {
     use dialoguer::Input;
@@ -593,13 +603,33 @@ fn validate_org(s: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// Persist a token to `path` (creating its parent dir) with 0600 permissions.
+/// Persist a token to `path` (creating its parent dir). On Unix the file is created
+/// with mode 0600 up front — never world-readable, even briefly — so the token is
+/// not exposed in the window between write and chmod.
 fn store_token(path: &Path, token: &str) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    std::fs::write(path, token.trim())?;
-    set_mode_600(&path.to_string_lossy());
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating token file {}", path.display()))?;
+        // `mode` only applies on creation; re-tighten so a pre-existing, loosely
+        // permissioned file is 0600 before the secret is written into it.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(token.trim().as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token.trim())?;
+    }
     Ok(())
 }
 
@@ -817,5 +847,24 @@ mod tests {
         assert!(validate_org("  my-org  ").is_ok());
         assert!(validate_org("").is_err());
         assert!(validate_org("owner/name").is_err()); // slash => looks like a repo
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn store_token_writes_trimmed_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vmfleet-store-token-{}", std::process::id()));
+        let path = dir.join("token");
+        // seed a world-readable file to prove the overwrite path also tightens perms
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::store_token(&path, "  gho_secret\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gho_secret");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

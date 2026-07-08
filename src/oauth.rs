@@ -86,7 +86,10 @@ fn resolve_base(from_env: Option<&str>) -> String {
         .unwrap_or_else(|| "https://github.com".to_string())
 }
 
-fn client_id() -> Result<String> {
+/// Whether a real client id is available (env override or a non-placeholder
+/// embedded default). Lets callers (e.g. guided install) avoid offering the
+/// browser flow when it can't possibly work. Public for that reason.
+pub fn client_id() -> Result<String> {
     resolve_client_id(std::env::var("VMFLEET_OAUTH_CLIENT_ID").ok().as_deref())
 }
 
@@ -94,13 +97,18 @@ fn base() -> String {
     resolve_base(std::env::var("VMFLEET_OAUTH_BASE").ok().as_deref())
 }
 
+/// The device-code response. GitHub can return `200 OK` with an error payload
+/// (e.g. `device_flow_disabled`) instead of the code fields, so every field is
+/// optional and we branch on `error` before unwrapping.
 #[derive(Deserialize)]
 struct DeviceCodeResp {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
+    device_code: Option<String>,
+    user_code: Option<String>,
+    verification_uri: Option<String>,
     #[serde(default)]
     interval: u64,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -169,17 +177,32 @@ fn run_device_flow(
         .into_json()
         .context("parsing device-code response")?;
 
+    // A 200 with an error payload (e.g. device flow disabled for the app) surfaces
+    // as a clear message instead of a cryptic "missing field device_code".
+    if let Some(err) = dc.error {
+        match dc.error_description {
+            Some(desc) if !desc.is_empty() => bail!("GitHub device-flow error: {err} — {desc}"),
+            _ => bail!("GitHub device-flow error: {err}"),
+        }
+    }
+    let device_code = dc
+        .device_code
+        .context("device-code response missing device_code")?;
+    let user_code = dc
+        .user_code
+        .context("device-code response missing user_code")?;
+    let verification_uri = dc
+        .verification_uri
+        .context("device-code response missing verification_uri")?;
+
     // 2. tell the user where to authorize, and open the browser for them
-    println!("\n! First copy your one-time code: {}", dc.user_code);
+    println!("\n! First copy your one-time code: {user_code}");
     if open {
-        open_browser(&dc.verification_uri);
-        println!(
-            "  Opening {} in your browser — enter the code there.",
-            dc.verification_uri
-        );
+        open_browser(&verification_uri);
+        println!("  Opening {verification_uri} in your browser — enter the code there.");
         println!("  (If nothing opened, visit that URL manually.)");
     } else {
-        println!("  Then open {} and enter it.", dc.verification_uri);
+        println!("  Then open {verification_uri} and enter it.");
     }
     println!("  Waiting for authorization (scope: {scope})...");
 
@@ -193,7 +216,7 @@ fn run_device_flow(
             .set("User-Agent", USER_AGENT)
             .send_form(&[
                 ("client_id", client_id),
-                ("device_code", &dc.device_code),
+                ("device_code", &device_code),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
             .context("polling for access token")?
@@ -207,10 +230,13 @@ fn run_device_flow(
         match resp.error.as_deref() {
             // still waiting on the user — keep polling at the current interval
             Some("authorization_pending") => {}
-            // GitHub asks us to back off: bump the interval it advertised (or 5s)
+            // Back off. GitHub's `interval` here is the *new absolute* minimum, so
+            // honor it directly; only add to the current one if it's omitted.
             Some("slow_down") => {
-                let bump = resp.interval.unwrap_or(FALLBACK_INTERVAL_SECS);
-                interval = poll_interval(interval.as_secs() + bump, poll_delay);
+                interval = match resp.interval {
+                    Some(secs) => poll_interval(secs, poll_delay),
+                    None => poll_interval(interval.as_secs() + FALLBACK_INTERVAL_SECS, poll_delay),
+                };
             }
             Some("expired_token") => {
                 bail!("device code expired before authorization; rerun `vmfleet login`")
@@ -296,6 +322,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(token, "gho_test_token");
+    }
+
+    #[test]
+    fn device_code_error_payload_surfaces_clearly() {
+        // A 200 with {error, error_description} must produce a readable message,
+        // not a cryptic "missing field device_code" serde error.
+        let fx = FixtureOAuth::start_device_error("device_flow_disabled", "enable it in the app");
+        let err = run_device_flow(&agent(), &fx.base_url, "c", "repo", Duration::ZERO, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("device_flow_disabled"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("enable it in the app"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

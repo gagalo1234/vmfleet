@@ -126,12 +126,15 @@ pub struct FixtureOAuth {
     pub base_url: String,
 }
 
-/// What the token endpoint should return.
+/// What the fixture should return.
 enum OAuthBehavior {
     /// `authorization_pending` for the first `pending` polls, then `access_token`.
     Token { token: String, pending: usize },
-    /// Always return this OAuth error code.
+    /// Token endpoint always returns this OAuth error code.
     Error(String),
+    /// The `device/code` endpoint returns `200` with this error payload (models a
+    /// misconfigured app, e.g. `device_flow_disabled`).
+    DeviceError { error: String, description: String },
 }
 
 impl FixtureOAuth {
@@ -146,6 +149,17 @@ impl FixtureOAuth {
     /// Always fail the token endpoint with the given OAuth error code.
     pub fn start_error(error: impl Into<String>) -> FixtureOAuth {
         Self::spawn(OAuthBehavior::Error(error.into()))
+    }
+
+    /// Fail the `device/code` endpoint with a `200 + {error, error_description}`.
+    pub fn start_device_error(
+        error: impl Into<String>,
+        description: impl Into<String>,
+    ) -> FixtureOAuth {
+        Self::spawn(OAuthBehavior::DeviceError {
+            error: error.into(),
+            description: description.into(),
+        })
     }
 
     fn spawn(behavior: OAuthBehavior) -> FixtureOAuth {
@@ -166,7 +180,12 @@ impl FixtureOAuth {
                     .and_then(|l| l.split_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = if path.contains("device/code") {
-                    r#"{"device_code":"DC-123","user_code":"WXYZ-1234","verification_uri":"https://github.test/login/device","interval":0}"#.to_string()
+                    match &behavior {
+                        OAuthBehavior::DeviceError { error, description } => {
+                            format!(r#"{{"error":"{error}","error_description":"{description}"}}"#)
+                        }
+                        _ => r#"{"device_code":"DC-123","user_code":"WXYZ-1234","verification_uri":"https://github.test/login/device","interval":0}"#.to_string(),
+                    }
                 } else if path.contains("oauth/access_token") {
                     match &behavior {
                         OAuthBehavior::Error(e) => format!(r#"{{"error":"{e}"}}"#),
@@ -178,6 +197,9 @@ impl FixtureOAuth {
                                 format!(r#"{{"access_token":"{token}"}}"#)
                             }
                         }
+                        // device flow bails at the device/code step in this mode, so
+                        // the token endpoint is never reached — return a filler body.
+                        OAuthBehavior::DeviceError { .. } => "{}".to_string(),
                     }
                 } else {
                     "{}".to_string()
